@@ -1,0 +1,3520 @@
+---
+title: "Documento Final TFM"
+author: "Oihane, Joaquín, Dae-Jin"
+date: "`r Sys.Date()`"
+linestretch: "1.5"
+output:   
+  bookdown::html_document2:
+  #theme: cerulean
+    df_print: paged
+    code_folding: hide 
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r, message = FALSE, warning = FALSE}
+# Librerias
+library(INLA)
+library(dplyr)
+library(knitr)
+library(locfit)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(AER)
+```
+
+```{r}
+# Base de datos
+players <- readRDS("./transfermarkt/todas las ligas/players_all.rds")
+injuries <- readRDS("./transfermarkt/todas las ligas/injury_df.rds")
+```
+
+## Descripción y analisis de los datos
+
+### Players
+
+Corregimos datos mezclados
+
+```{r}
+# Hay jugadores que tienen 2 filas por cada temporada porque se han cambiado de equipo.
+jugadores_cambio_club_l <- subset(players, duplicated(players[c("player_id", "year")]) | duplicated(players[c("player_id", "year")], fromLast = TRUE))
+
+# Comprobamos que los equipos de ambas filas repetidas sean diferentes. Vemos que todos estan bien pero que hay problemas con manu-garcia, adrian-lopez, jose-salinas, sergio-sanchez, el-hadji-diouf y adama-traore.
+df_mezclado <- subset(jugadores_cambio_club_l, duplicated(jugadores_cambio_club_l[c("player_id", "year", "club_id")]) | duplicated(jugadores_cambio_club_l[c("player_id", "year", "club_id")], fromLast = TRUE))
+
+# Los datos de los jugadores mencionados previamente se han mezclado, sus matches_played y minutes_played para ambos jugadores con el mismo nombre estan repetidas (datos verificados en transfermarkt), corregimos y eliminamos:
+# which(rownames(players_all_league) == "52113") -> para saber que fila eliminar
+players2 <- players[-c(2114, 2123, 2335, 2358, 2367, 2393, 2405, 2427, 2437, 2460, 3962, 3972, 10120, 10121, 12538, 12543, 52113, 52117), ]
+
+jugadores_cambio_club_l <- subset(players2, duplicated(players2[c("player_id", "year")]) | duplicated(players2[c("player_id", "year")], fromLast = TRUE))
+
+# Vemos que la variable market_value aparece tanto con notacion cientifica como sin ella, por lo que lo corregimos y ponemos todos los valores igual
+players2$market_value <- ifelse(grepl("e", players2$market_value), format(players2$market_value, scientific = FALSE), players2$market_value)
+players2$market_value <- as.integer(trimws(players2$market_value))
+
+``` 
+
+Hacemos un resumen de las variables y estudiamos su estructura y sus características.
+
+```{r}
+# Corregimos la estructura de las variables 
+players2$player_name <- factor(players2$player_name)
+players2$player_id <- factor(players2$player_id)
+#players2$club_name <- factor(players2$club_name)
+players2$club_id <- factor(players2$club_id)
+players2$points <- as.numeric(players2$points)
+players2$ranking <- as.numeric(players2$ranking)
+
+# Estrutura de las variables
+str(players2[1:10])
+
+# Vemos que hay un jugador que tiene minutos negativos jugados, por lo que corregimos a 0
+players2[players2$minutes_played == -2 & !is.na(players2$minutes_played), 10] <- 0
+
+# Resumen de las variables
+summary(players2[1:10])
+
+```
+
+### Injuries
+
+Corregimos datos necesarios.
+
+```{r}
+# Corregimos datos mal introducidos y eliminamos las filas con datos faltantes en la variable respuesta
+injuries[(injuries$until) == "0221-05-06" & !is.na(injuries$until), 6] <- "2021-05-06"
+injuries <- injuries[!is.na(injuries$days_missed), ]
+injuries <- injuries[!injuries$season == 1996 & !injuries$season == 2004, ]
+
+# Introducimos a partir de la variable season la variable año ya que será más manejable que la variable season
+injuries$year <- paste0("20", substr(injuries$season, 1, 2))
+```
+
+Hacemos un resumen de las variables y estudiamos su estructura y sus características.
+
+```{r}
+# Estrutura de las variables
+str(injuries)
+
+# Resumen
+summary(injuries)
+```
+
+De esta manera podemos observar que hay 345 tipos de lesión que se tienen en cuenta. Hacemos un resumen de las lesiones más frecuentes.
+
+```{r}
+sort(table(injuries$injury),  decreasing = TRUE)[1:25]
+lesiones <- c("Hamstring Injury", "Muscle Injury", "Ankle Injury", "Knee Injury", "Shoulder Injury", "Calf Injury", "Foot Injury")
+injuries_lesiones <- injuries[injuries$injury %in% lesiones, ]
+by(injuries_lesiones$days_missed, injuries_lesiones$injury, summary)
+```
+
+Podemos observar el summary de las 7 lesiones más frecuentes entre los futbolistas profesionales europeos.
+
+## Criterio de eliminación de filas
+
+### Players
+
+Los jugadores que no han jugado ningun minuto o tienen valores faltantes se eliminan del data frame, ya que al emplear la variable minutes_played como offset, si dejamos en el data frame los jugadores que se han lesionado en los entrenamientos (minutes_played = 0 & injury_total > 0) ya que no tenemos los minutos entrenados, el modelo se puede ajustar de forma erronea.
+
+```{r}
+players_criterio <- players2[!is.na(players2$minutes_played) | !is.na(players2$matches_played), ]
+players_criterio <- players_criterio[!players_criterio$minutes_played == 0, ]
+```
+
+## Exposure 
+
+### Players
+
+La variable más adecuada con la que definimos el exposure es *minutes_played*, ya que contiene el número exacto de minutos que los jugadores juegan en los partidos y también los minutos en los que los jugadores se exponen a una lesión. La variable matches_played no es tan precisa ya que un jugador ha podido jugar 10 minutos de 1 partido y otro 90 minutos del mismo partido y la exposición de ambos sería la misma pero en realidad este segundo jugador se expone más a una lesión que el primero.
+
+Por lo tanto, las unidades del exposure en este caso serían minutos jugados-jugador. Podemos transformar el exposure para que sus unidades sean 100 h jugadas-jugador y que las gráficas sean más visuales, para ello se dividen los minutos jugados entre 60 para obtener horas, y entre 100 para convertirlas finalmente en  100 h jugadas-jugador.
+
+```{r}
+players_criterio$horas100 <- (players_criterio$minutes_played)/(60*100)
+```
+
+## Variable Year
+
+Ya que uno de los objetivos es estudiar la evolución del número de lesiones a lo largo de los años, introducimos la variable year en el modelo. Para ello deberemos estudiar la mejor forma de introducir esta variables, ya que es posible que la relación que tiene esta variable con la variable respuesta sea lineal, polinómica o suavizada. Acotamos los años desde 2011 a 2020 ya que son los años con los que trabajaremos.
+
+```{r, warning = FALSE}
+df_years <- players_criterio[players_criterio$year >= 2011 & players_criterio$year <= 2020, ]
+df_years$year <- df_years$year - 2010
+
+# Year como variable continua
+model_year_continuo <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, year)) ~ 1 + offset(log(horas100)) + year,
+  family = "0poisson",
+  data = data.frame(injuries_total = df_years$injuries_total, year = df_years$year, horas100 = df_years$horas100),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)))))
+ 
+# Year como variable cuadratica
+model_year_cuadratico <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, I(year^2))) ~ 1 + offset(log(horas100)) + I(year^2),
+  family = "0poisson",
+  data = data.frame(injuries_total = df_years$injuries_total, year = df_years$year, horas100 = df_years$horas100),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)))))
+
+# Year como variable cubica
+model_year_cubico <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, I(year^2))) ~ 1 + offset(log(horas100)) + I(year^2),
+  family = "0poisson",
+  data = data.frame(injuries_total = df_years$injuries_total, year = df_years$year, horas100 = df_years$horas100),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)))))
+
+# Year como variable suavizada
+model_year_suavizado <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, year)) ~ 1 + offset(log(horas100)) + f(year, model = "rw2"),
+  family = "0poisson",
+  data = data.frame(injuries_total = df_years$injuries_total, year = df_years$year, horas100 = df_years$horas100),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)))))
+
+dd1 <- c(round(model_year_continuo$waic$waic, 2), round(model_year_cuadratico$waic$waic, 2), round(model_year_cubico$waic$waic, 2), round(model_year_suavizado$waic$waic, 2))
+dd2 <- c("Year continuo", "Year cuadratico", "Year cúbico", "Year suavizado")
+dd <- cbind(dd2, dd1)
+kable(dd, col.names = c(" ", "WAIC"))
+
+```
+
+Finalemnte, vemos que el modelo con menor WAIC es el modelo con la variable year suavizada. Observamos la tendencia de dicha variable.
+
+```{r}
+# Gráfica Age Suavizado
+year <- seq(from = 2011, to = 2020, by = 1)
+plot(year, model_year_suavizado$summary.random$year$mean, type = "b", ylab = "Year Suavizado", ylim = c(-1, 1))
+lines(year, model_year_suavizado$summary.random$year[, 4], col = "red")
+lines(year, model_year_suavizado$summary.random$year[, 6], col = "red")
+```
+
+Sin embargo, dada la representación gráfica, observamos que la tendencia de la misma es bastante lineal, y que respecto a la poca variación en el WAIC del modelo con year suavizado o year lineal, optamos por tomar la variable Year sin suavizar, determinando que tiene una relación lineal con la variable respuesta. Además, esto nos posibilita la interpretación de dicha variable.
+
+Comprobamos si es estadísticamente relevante introducir la variable Year en el predictor lineal de la Bernoulli, así como en el predictor lienal de la Poisson.
+
+```{r, warning = FALSE}
+# Calculo de la probabilidad de las betas y gammas sean < 0
+b1 <- inla.pmarginal(0, marginal = model_year_continuo$marginals.fixed$year) # probabilidad < 0
+g1 <- inla.pmarginal(0, marginal = model_year_continuo$marginals.hyperpar$`beta1 for 0poisson  observations`) # probabilidad < 0
+nombres <- c("P(Beta < 0)", "P(Gamma < 0)")
+datos_tabla <- data.frame(b1, g1)
+row.names(datos_tabla) <- c("Years")
+tabla_year <- kable(datos_tabla, col.names = nombres #, format = "latex"
+)
+
+tabla_year
+```
+
+De esta manera comprobamos la relevancia de la variable Year en ambos predictores lineales.
+
+## Modelos
+
+### Ligas
+
+#### Incidence
+
+##### Comparación entre ligas
+
+Se cogen los datos de las 5 ligas europeas a lo largo de 10 años, entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{LaLiga} + ... + \beta_4 d_{SerieA}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{LaLiga} + ... + \gamma_4 d_{SerieA}$$
+
+**Modelo**
+
+```{r, warning=FALSE}
+# Data frame con datos binarios (0/1) de las 5 diferentes ligas europeas
+df <- players_all_league_criterio[(players_all_league_criterio$year >= "2011") & (players_all_league_criterio$year <= "2020"), ] %>% droplevels()
+
+df$league <- factor(df$league)
+liga_names <- levels(df$league)
+
+ligas <- list()
+for(i in 1:length(liga_names)){
+  nombre <- liga_names[i]
+  ligas[[nombre]] <- as.numeric(df$league)
+  ligas[[nombre]][df$league == nombre] <- 1
+  ligas[[nombre]][df$league != nombre] <- 0
+}
+
+# Modelos
+model_ligas_sinyear <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, laliga, ligue1, premier, seriea)) ~ 1  + offset(log(horas100)) + laliga + ligue1 + premier + seriea,
+  family = "0poisson",
+  data = data.frame(injuries_total = df$injuries_total, horas100 = df$horas100, laliga = ligas[[2]], ligue1 = ligas[[3]], premier = ligas[[4]], seriea = ligas[[5]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)))))
+
+
+model_ligas_sinyear$summary.fixed
+model_ligas_sinyear$summary.hyperpar
+
+```
+
+**Cálculo de IR y IRR**
+
+```{r}
+
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_ligas_sinyear <- inla.posterior.sample(n = n, 
+                                 res = model_ligas_sinyear)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[1]]
+    x[i, 7] <- y[[i]]$hyperpar[[2]]
+    x[i, 8] <- y[[i]]$hyperpar[[3]]
+    x[i, 9] <- y[[i]]$hyperpar[[4]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+  }
+  return(x)
+}
+
+ss_ligas <- matrix(NA, nrow = n, ncol = 10)
+colnames(ss_ligas) <- c("b_bundesliga", "b_laliga", "b_ligue1", "b_premier", 
+                       "b_seriea", "zi_bundesliga", "zi_laliga", "zi_ligue1", 
+                       "zi_premier", "zi_seriea")
+
+ss_ligas <- sample_status(ss_ligas, samples_ligas_sinyear)
+
+IR_code_eq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 6]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 6] + y[, 7]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 6] + y[, 8]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 6] + y[, 9]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 6] + y[, 10]))
+  
+  # IRR entre grupos de Status
+  x[, 6] <- exp(y[, 2])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 7]))
+  x[, 7] <- exp(y[, 3])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 8]))
+  x[, 8] <- exp(y[, 4])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 9]))
+  x[, 9] <- exp(y[, 5])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 10]))
+  
+  x[, 10] <- (exp(y[, 3])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 8])))
+  x[, 11] <- (exp(y[, 4])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 9])))
+  x[, 12] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 10])))
+  
+  x[, 13] <- (exp(y[, 4])*(1 + exp(y[, 6] + y[, 8] )))/(exp(y[, 3])*(1 + exp(y[, 6] + y[, 9])))
+  x[, 14] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 8] )))/(exp(y[, 3])*(1 + exp(y[, 6] + y[, 10])))
+  
+  x[, 15] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 9] )))/(exp(y[, 4])*(1 + exp(y[, 6] + y[, 10])))
+  return(x)
+}
+
+IR_ligas_sinyear <- matrix(NA, nrow = n, ncol = 15)
+colnames(IR_ligas_sinyear) <- c("IR_bundesliga", "IR_laliga", "IR_ligue1", "IR_premier", 
+                  "IR_seriea", "IRR_l2VSl1", "IRR_l3VSl1", "IRR_l4VSl1", 
+                  "IRR_l5VSl1", "IRR_l3VSl2", "IRR_l4VSl2", "IRR_l5VSl2", 
+                  "IRR_l4VSl3", "IRR_l5VSl3", "IRR_l5VSl4")
+
+IR_ligas_sinyear <- IR_code_eq(IR_ligas_sinyear, ss_ligas)
+
+myq_ligas <- matrix(NA, nrow = 3, ncol = 15)
+colnames(myq_ligas) <- colnames(IR_ligas_sinyear)
+rownames(myq_ligas) <- c("mean", "IC_lower", "IC_upper")
+
+myq_IR <- function(x, y){ 
+  for (i in 1:ncol(myq_ligas)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq_ligas <- myq_IR(myq_ligas, IR_ligas_sinyear)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries_ligas <- cbind(paste0(myq_ligas[1, 1], "(", myq_ligas[2, 1], "-", myq_ligas[3, 1], ")"),
+                       paste0(myq_ligas[1, 2], "(", myq_ligas[2, 2], "-", myq_ligas[3, 2], ")"),
+                       paste0(myq_ligas[1, 3], "(", myq_ligas[2, 3], "-", myq_ligas[3, 3], ")"),
+                       paste0(myq_ligas[1, 4], "(", myq_ligas[2, 4], "-", myq_ligas[3, 4], ")"),
+                       paste0(myq_ligas[1, 5], "(", myq_ligas[2, 5], "-", myq_ligas[3, 5], ")"),
+                       paste0(myq_ligas[1, 6], "(", myq_ligas[2, 6], "-", myq_ligas[3, 6], ")"),
+                       paste0(myq_ligas[1, 7], "(", myq_ligas[2, 7], "-", myq_ligas[3, 7], ")"),
+                       paste0(myq_ligas[1, 8], "(", myq_ligas[2, 8], "-", myq_ligas[3, 8], ")"),
+                       paste0(myq_ligas[1, 9], "(", myq_ligas[2, 9], "-", myq_ligas[3, 9], ")"),
+                       paste0(myq_ligas[1, 10], "(", myq_ligas[2, 10], "-", myq_ligas[3, 10], ")"),
+                       paste0(myq_ligas[1, 11], "(", myq_ligas[2, 11], "-", myq_ligas[3, 11], ")"),
+                       paste0(myq_ligas[1, 12], "(", myq_ligas[2, 12], "-", myq_ligas[3, 12], ")"),
+                       paste0(myq_ligas[1, 13], "(", myq_ligas[2, 13], "-", myq_ligas[3, 13], ")"),
+                       paste0(myq_ligas[1, 14], "(", myq_ligas[2, 14], "-", myq_ligas[3, 14], ")"),
+                       paste0(myq_ligas[1, 15], "(", myq_ligas[2, 15], "-", myq_ligas[3, 15], ")"))
+
+nombres_ligas <- c(paste0(" "),
+             paste0(liga_names[1]),
+             paste0(liga_names[2]),
+             paste0(liga_names[3]),
+             paste0(liga_names[4]),
+             paste0(liga_names[5]),
+             paste0(liga_names[2], " VS ", liga_names[1]),
+             paste0(liga_names[3], " VS ", liga_names[1]),
+             paste0(liga_names[4], " VS ", liga_names[1]),
+             paste0(liga_names[5], " VS ", liga_names[1]),
+             paste0(liga_names[3], " VS ", liga_names[2]),
+             paste0(liga_names[4], " VS ", liga_names[2]),
+             paste0(liga_names[5], " VS ", liga_names[2]),
+             paste0(liga_names[4], " VS ", liga_names[3]),
+             paste0(liga_names[5], " VS ", liga_names[3]),
+             paste0(liga_names[5], " VS ", liga_names[4]))
+
+data_ligas <- data.frame(Injury, injuries_ligas)
+tabla_ligas_sinyear <- kable(data_ligas, col.names = nombres_ligas #, format = "latex"
+)
+
+
+```
+
+```{r}
+# tabla
+tabla_ligas_sinyear
+# boxplot
+boxplot(IR_ligas_sinyear[, 1:5])
+```
+
+##### Comparación entre ligas a lo largo de los años
+
+Se cogen los datos de las 5 ligas europeas a lo largo de 10 años, entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{LaLiga} + ... + \beta_4 d_{SerieA} + \beta_5 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{LaLiga} + ... + \gamma_4 d_{SerieA} + \gamma_5 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Reducimos los valores de year para que el modelo no sea tan costoso
+df$year <- df$year - 2010
+
+# Modelo
+model_ligas <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, laliga, ligue1, premier, seriea, year)) ~ 1  + offset(log(horas100)) + laliga + ligue1 + premier + seriea + year,
+  family = "0poisson",
+  data = data.frame(injuries_total = df$injuries_total, horas100 = df$horas100, laliga = ligas[[2]], ligue1 = ligas[[3]], premier = ligas[[4]], seriea = ligas[[5]], year = df$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_ligas$summary.fix, 4)
+round(model_ligas$summary.hyperpar, 4)
+
+```
+
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales, para cada liga en cada año.
+
+```{r}
+samples_ligas <- inla.posterior.sample(n = n, 
+                                 res = model_ligas)
+
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 6] <- y[[i]]$hyperpar[[1]]
+    x[i, 7] <- y[[i]]$hyperpar[[2]]
+    x[i, 8] <- y[[i]]$hyperpar[[3]]
+    x[i, 9] <- y[[i]]$hyperpar[[4]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+    x[i, 11] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 12] <- y[[i]]$hyperpar[[6]]
+  }
+  return(x)
+}
+
+esti_ligas <- matrix(NA, nrow = n, ncol = 12)
+colnames(esti_ligas) <- c("B0", "B1", "B2", "B3",
+                          "B4", "G0", "G1", "G2", 
+                          "G3", "G4", "BY", "GY")
+
+esti_ligas <- sample_estimacion(esti_ligas, samples_ligas)
+
+## Estimaciones
+
+estimaciones_ligas <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_ligas[ , 1] + esti_ligas[ , 11])
+names(lambda)[1] <- liga_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_ligas[ , 6] + esti_ligas[ , 12])
+names(pi)[1] <- liga_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_ligas[ , 1] + esti_ligas[ , 11]*i)
+  pi[[1]][ , i] <- expit(esti_ligas[ , 6] + esti_ligas[ , 12]*i)
+}
+
+for(j in 2:5){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_ligas[ , 1] + esti_ligas[ , j] + esti_ligas[ , 11])
+names(lambda)[j] <- liga_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_ligas[ , 6] + esti_ligas[ , j + 5] + esti_ligas[ , 12])
+names(pi)[j] <- liga_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_ligas[ , 1] + esti_ligas[ , j] + esti_ligas[ , 11]*i)
+  pi[[j]][ , i] <- expit(esti_ligas[ , 6] + esti_ligas[ , j + 5] + esti_ligas[ , 12]*i)
+}}
+
+for(j in 1:5){
+  estimaciones_ligas[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_ligas)[j] <- liga_names[j]
+   for(i in 1:10){
+    estimaciones_ligas[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+year_names <- seq(from = 2011, to = 2020, by = 1)
+
+media_estimaciones <- matrix(ncol = 10, nrow =5)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_ligas)
+rownames(media_estimaciones) <- liga_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow =5)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_ligas)
+rownames(ICl_estimaciones) <- liga_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow =5)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_ligas)
+rownames(ICu_estimaciones) <- liga_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+Lo dibujamos graficamente
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long)[4] <- "qL"
+colnames(datos_long)[5] <- "qU"
+datos_long$Muestra <- as.factor(datos_long$Muestra)
+str(datos_long$Muestra)
+levels(datos_long$Muestra) <- c("Bundesliga", "La Liga", "Ligue 1", "Premier", "Serie A")
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Número de lesiones / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange", "purple")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange", "purple","black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+
+#### Burden
+
+##### Comparación entre ligas
+
+Se cogen los datos de las 5 ligas europeas a lo largo de 10 años, entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{LaLiga} + ... + \beta_4 d_{SerieA}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{LaLiga} + ... + \gamma_4 d_{SerieA}$$
+
+**Modelo**
+
+```{r, warning=FALSE}
+# Modelos
+model_ligas_sinyear_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, laliga, ligue1, premier, seriea)) ~ 1  + offset(log(horas100)) + laliga + ligue1 + premier + seriea,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df$days_lost_total, horas100 = df$horas100, laliga = ligas[[2]], ligue1 = ligas[[3]], premier = ligas[[4]], seriea = ligas[[5]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)))))
+
+
+model_ligas_sinyear_b$summary.fixed
+model_ligas_sinyear_b$summary.hyperpar
+
+```
+
+**Cálculo de IR y IRR**
+
+```{r}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_ligas_sinyear_b <- inla.posterior.sample(n = n, 
+                                 res = model_ligas_sinyear_b)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[1]]
+    x[i, 7] <- y[[i]]$hyperpar[[2]]
+    x[i, 8] <- y[[i]]$hyperpar[[3]]
+    x[i, 9] <- y[[i]]$hyperpar[[4]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+  }
+  return(x)
+}
+
+ss_ligas <- matrix(NA, nrow = n, ncol = 10)
+colnames(ss_ligas) <- c("b_bundesliga", "b_laliga", "b_ligue1", "b_premier", 
+                       "b_seriea", "zi_bundesliga", "zi_laliga", "zi_ligue1", 
+                       "zi_premier", "zi_seriea")
+
+ss_ligas <- sample_status(ss_ligas, samples_ligas_sinyear_b)
+
+DR_code_eq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 6]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 6] + y[, 7]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 6] + y[, 8]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 6] + y[, 9]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 6] + y[, 10]))
+  
+  # IRR entre grupos de Status
+  x[, 6] <- exp(y[, 2])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 7]))
+  x[, 7] <- exp(y[, 3])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 8]))
+  x[, 8] <- exp(y[, 4])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 9]))
+  x[, 9] <- exp(y[, 5])*(1 + exp(y[, 6]))/(1 + exp(y[, 6] + y[, 10]))
+  
+  x[, 10] <- (exp(y[, 3])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 8])))
+  x[, 11] <- (exp(y[, 4])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 9])))
+  x[, 12] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 7])))/(exp(y[, 2])*(1 + exp(y[, 6] + y[, 10])))
+  
+  x[, 13] <- (exp(y[, 4])*(1 + exp(y[, 6] + y[, 8] )))/(exp(y[, 3])*(1 + exp(y[, 6] + y[, 9])))
+  x[, 14] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 8] )))/(exp(y[, 3])*(1 + exp(y[, 6] + y[, 10])))
+  
+  x[, 15] <- (exp(y[, 5])*(1 + exp(y[, 6] + y[, 9] )))/(exp(y[, 4])*(1 + exp(y[, 6] + y[, 10])))
+  return(x)
+}
+
+BR_ligas_sinyear_b <- matrix(NA, nrow = n, ncol = 15)
+colnames(BR_ligas_sinyear_b) <- c("BR_bundesliga", "BR_laliga", "BR_ligue1", "BR_premier", 
+                  "BR_seriea", "BRR_l2VSl1", "BRR_l3VSl1", "BRR_l4VSl1", 
+                  "BRR_l5VSl1", "BRR_l3VSl2", "BRR_l4VSl2", "BRR_l5VSl2", 
+                  "BRR_l4VSl3", "BRR_l5VSl3", "BRR_l5VSl4")
+
+BR_ligas_sinyear_b <- DR_code_eq(BR_ligas_sinyear_b, ss_ligas)
+
+myq_ligas <- matrix(NA, nrow = 3, ncol = 15)
+colnames(myq_ligas) <- colnames(BR_ligas_sinyear_b)
+rownames(myq_ligas) <- c("mean", "IC_lower", "IC_upper")
+
+myq_BR <- function(x, y){ 
+  for (i in 1:ncol(myq_ligas)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq_ligas <- myq_BR(myq_ligas, BR_ligas_sinyear_b)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries_ligas <- cbind(paste0(myq_ligas[1, 1], "(", myq_ligas[2, 1], "-", myq_ligas[3, 1], ")"),
+                       paste0(myq_ligas[1, 2], "(", myq_ligas[2, 2], "-", myq_ligas[3, 2], ")"),
+                       paste0(myq_ligas[1, 3], "(", myq_ligas[2, 3], "-", myq_ligas[3, 3], ")"),
+                       paste0(myq_ligas[1, 4], "(", myq_ligas[2, 4], "-", myq_ligas[3, 4], ")"),
+                       paste0(myq_ligas[1, 5], "(", myq_ligas[2, 5], "-", myq_ligas[3, 5], ")"),
+                       paste0(myq_ligas[1, 6], "(", myq_ligas[2, 6], "-", myq_ligas[3, 6], ")"),
+                       paste0(myq_ligas[1, 7], "(", myq_ligas[2, 7], "-", myq_ligas[3, 7], ")"),
+                       paste0(myq_ligas[1, 8], "(", myq_ligas[2, 8], "-", myq_ligas[3, 8], ")"),
+                       paste0(myq_ligas[1, 9], "(", myq_ligas[2, 9], "-", myq_ligas[3, 9], ")"),
+                       paste0(myq_ligas[1, 10], "(", myq_ligas[2, 10], "-", myq_ligas[3, 10], ")"),
+                       paste0(myq_ligas[1, 11], "(", myq_ligas[2, 11], "-", myq_ligas[3, 11], ")"),
+                       paste0(myq_ligas[1, 12], "(", myq_ligas[2, 12], "-", myq_ligas[3, 12], ")"),
+                       paste0(myq_ligas[1, 13], "(", myq_ligas[2, 13], "-", myq_ligas[3, 13], ")"),
+                       paste0(myq_ligas[1, 14], "(", myq_ligas[2, 14], "-", myq_ligas[3, 14], ")"),
+                       paste0(myq_ligas[1, 15], "(", myq_ligas[2, 15], "-", myq_ligas[3, 15], ")"))
+
+nombres_ligas <- c(paste0(" "),
+             paste0(liga_names[1]),
+             paste0(liga_names[2]),
+             paste0(liga_names[3]),
+             paste0(liga_names[4]),
+             paste0(liga_names[5]),
+             paste0(liga_names[2], " VS ", liga_names[1]),
+             paste0(liga_names[3], " VS ", liga_names[1]),
+             paste0(liga_names[4], " VS ", liga_names[1]),
+             paste0(liga_names[5], " VS ", liga_names[1]),
+             paste0(liga_names[3], " VS ", liga_names[2]),
+             paste0(liga_names[4], " VS ", liga_names[2]),
+             paste0(liga_names[5], " VS ", liga_names[2]),
+             paste0(liga_names[4], " VS ", liga_names[3]),
+             paste0(liga_names[5], " VS ", liga_names[3]),
+             paste0(liga_names[5], " VS ", liga_names[4]))
+
+data_ligas <- data.frame(Injury, injuries_ligas)
+tabla_ligas_sinyear_b <- kable(data_ligas, col.names = nombres_ligas #, format = "latex"
+)
+
+```
+
+```{r}
+# tabla
+tabla_ligas_sinyear_b
+# boxplot
+boxplot(BR_ligas_sinyear_b[, 1:5])
+```
+
+##### Comparación entre ligas a lo largo de los años
+
+Se cogen los datos de las 5 ligas europeas a lo largo de 10 años, entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{LaLiga} + ... + \beta_4 d_{SerieA} + \beta_5 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{LaLiga} + ... + \gamma_4 d_{SerieA} + \gamma_5 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Modelo
+model_ligas_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, laliga, ligue1, premier, seriea, year)) ~ 1  + offset(log(horas100)) + laliga + ligue1 + premier + seriea + year,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df$days_lost_total, horas100 = df$horas100, laliga = ligas[[2]], ligue1 = ligas[[3]], premier = ligas[[4]], seriea = ligas[[5]], year = df$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_ligas_b$summary.fix, 4)
+round(model_ligas_b$summary.hyperpar, 4)
+
+```
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales, para cada liga en cada año.
+
+```{r}
+samples_ligas_b <- inla.posterior.sample(n = n, 
+                                 res = model_ligas_b)
+
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 6] <- y[[i]]$hyperpar[[1]]
+    x[i, 7] <- y[[i]]$hyperpar[[2]]
+    x[i, 8] <- y[[i]]$hyperpar[[3]]
+    x[i, 9] <- y[[i]]$hyperpar[[4]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+    x[i, 11] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 12] <- y[[i]]$hyperpar[[6]]
+  }
+  return(x)
+}
+
+esti_ligas <- matrix(NA, nrow = n, ncol = 12)
+colnames(esti_ligas) <- c("B0", "B1", "B2", "B3",
+                          "B4", "G0", "G1", "G2", 
+                          "G3", "G4", "BY", "GY")
+
+esti_ligas <- sample_estimacion(esti_ligas, samples_ligas_b)
+
+## Estimaciones
+
+estimaciones_ligas_b <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_ligas[ , 1] + esti_ligas[ , 11])
+names(lambda)[1] <- liga_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_ligas[ , 6] + esti_ligas[ , 12])
+names(pi)[1] <- liga_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_ligas[ , 1] + esti_ligas[ , 11]*i)
+  pi[[1]][ , i] <- expit(esti_ligas[ , 6] + esti_ligas[ , 12]*i)
+}
+
+for(j in 2:5){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_ligas[ , 1] + esti_ligas[ , j] + esti_ligas[ , 11])
+names(lambda)[j] <- liga_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_ligas[ , 6] + esti_ligas[ , j + 5] + esti_ligas[ , 12])
+names(pi)[j] <- liga_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_ligas[ , 1] + esti_ligas[ , j] + esti_ligas[ , 11]*i)
+  pi[[j]][ , i] <- expit(esti_ligas[ , 6] + esti_ligas[ , j + 5] + esti_ligas[ , 12]*i)
+}}
+
+for(j in 1:5){
+  estimaciones_ligas_b[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_ligas_b)[j] <- liga_names[j]
+   for(i in 1:10){
+    estimaciones_ligas_b[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+year_names <- seq(from = 2011, to = 2020, by = 1)
+
+media_estimaciones <- matrix(ncol = 10, nrow =5)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_ligas_b)
+rownames(media_estimaciones) <- liga_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow =5)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_ligas_b)
+rownames(ICl_estimaciones) <- liga_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:5){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow =5)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_ligas_b)
+rownames(ICu_estimaciones) <- liga_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+Lo dibujamos graficamente
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long)[4] <- "qL"
+colnames(datos_long)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Días totales perdidos / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange", "purple")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange", "purple","black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+
+### Equipos
+
+#### Incidence
+##### Comparación entre los 7 mejores equipos
+
+Se cogen los datos de los 7 equipos europeos más importantes, los que más veces han ganado la Champion League en los últimos 25 años, a lo largo de 10 años entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{FC Barcelona} + ... + \beta_6 d_{AC Mailand}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{FC Barcelona} + ... + \gamma_6 d_{AC Mailand}$$
+
+**Modelo**
+
+```{r, warning=FALSE}
+# Teniendo en cuenta las victoras desde 1998/1999
+clubes <- c("real-madrid", "fc-barcelona", "fc-chelsea", "fc-bayern-munchen", "fc-liverpool", "manchester-united", "ac-mailand")
+df2 <- players_all_league_criterio[players_all_league_criterio$year >= 2011 & players_all_league_criterio$year <= 2020 & players_all_league_criterio$club_name %in% clubes, ]
+
+df2$club_name <- as.factor(df2$club_name)
+equipos_names <- levels(df2$club_name)
+
+equipos <- list()
+for(i in 1:length(equipos_names)){
+  nombre <- equipos_names[i]
+  equipos[[nombre]] <- as.numeric(df2$club_name)
+  equipos[[nombre]][df2$club_name == nombre] <- 1
+  equipos[[nombre]][df2$club_name != nombre] <- 0
+}
+
+# Modelos
+model_equipos_sinyear <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, barcelona, bayern, chelsea, liverpool, manchester, realmadrid)) ~ 1 + offset(log(horas100)) + barcelona + bayern + chelsea + liverpool + manchester + realmadrid,
+  family = "0poisson",
+  data = data.frame(injuries_total = df2$injuries_total, horas100 = df2$horas100, barcelona = equipos[[2]], bayern = equipos[[3]], chelsea = equipos[[4]], liverpool = equipos[[5]], manchester = equipos[[6]], realmadrid = equipos[[7]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_equipos_sinyear$summary.fix, 4)
+round(model_equipos_sinyear$summary.hyperpar, 4)
+```
+
+**Cálculo de IR y IRR**
+
+```{r, warning = FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_eq_sinyear <- inla.posterior.sample(n = n, 
+                                 res = model_equipos_sinyear)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+  }
+  return(x)
+}
+
+ss <- matrix(NA, nrow = n, ncol = 14)
+colnames(ss) <- c("b_equipo1", "b_equipo2", "b_equipo3", "b_equipo4", "b_equipo5", 
+                  "b_equipo6", "b_equipo7", "zi_equipo1", "zi_equipo2", "zi_equipo3", 
+                  "zi_equipo4", "zi_equipo5", "zi_equipo6", "zi_equipo7")
+
+ss <- sample_status(ss, samples_eq_sinyear)
+
+IR_code_eqq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 8]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 8] + y[, 9]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 8] + y[, 10]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 8] + y[, 11]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 8] + y[, 12]))
+  x[, 6] <- exp(y[, 1] + y[, 6])/(1 + exp(y[, 8] + y[, 13]))
+  x[, 7] <- exp(y[, 1] + y[, 7])/(1 + exp(y[, 8] + y[, 14]))
+  
+  # IRR entre grupos de Status
+  x[, 8] <- exp(y[, 2])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 9]))
+  x[, 9] <- exp(y[, 3])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 10]))
+  x[, 10] <- exp(y[, 4])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 11]))
+  x[, 11] <- exp(y[, 5])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 12]))
+  x[, 12] <- exp(y[, 6])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 13]))
+  x[, 13] <- exp(y[, 7])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 14]))
+  
+  x[, 14] <- (exp(y[, 3])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 10])))
+  x[, 15] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 16] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 17] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 18] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 19] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 20] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 21] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 22] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 23] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 24] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 25] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 26] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 27] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 14])))
+      
+  x[, 28] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 13] )))/(exp(y[, 6])*(1 + exp(y[, 8] + y[, 14])))
+  return(x)
+}
+
+IR_eq_sinyear <- matrix(NA, nrow = n, ncol = 28)
+colnames(IR_eq_sinyear) <- c("IR_milan", "IR_barcelona", "IR_bayern", "IR_chelsea", 
+                  "IR_liverpool", "IR_manchester", "IR_realmadrid", "IRR_e2VSe1", "IRR_e3VSe1", "IRR_e4VSe1", 
+                  "IRR_e5VSe1", "IRR_e6VSe1", "IRR_e7VSe1", "IRR_e3VSe2", "IRR_e4VSe2", "IRR_e5VSe2",
+                  "IRR_e6VSe2", "IRR_e7VSe2", "IRR_e4VSe3", "IRR_e5VSe3", "IRR_e6VSe3", "IRR_e7VSe3",
+                  "IRR_e5VSe4", "IRR_e6VSe4", "IRR_e7VSe4", "IRR_e6VSe5", "IRR_e7VSe5", "IRR_e7VSe6")
+
+IR_eq_sinyear <- IR_code_eqq(IR_eq_sinyear, ss)
+
+myq <- matrix(NA, nrow = 3, ncol = 28)
+colnames(myq) <- colnames(IR_eq_sinyear)
+rownames(myq) <- c("mean", "IC_lower", "IC_upper")
+
+myq_IR <- function(x, y){ 
+  for (i in 1:ncol(myq)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq <- myq_IR(myq, IR_eq_sinyear)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries <- cbind(paste0(myq[1, 1], "(", myq[2, 1], "-", myq[3, 1], ")"),
+                  paste0(myq[1, 2], "(", myq[2, 2], "-", myq[3, 2], ")"),
+                  paste0(myq[1, 3], "(", myq[2, 3], "-", myq[3, 3], ")"),
+                  paste0(myq[1, 4], "(", myq[2, 4], "-", myq[3, 4], ")"),
+                  paste0(myq[1, 5], "(", myq[2, 5], "-", myq[3, 5], ")"),
+                  paste0(myq[1, 6], "(", myq[2, 6], "-", myq[3, 6], ")"),
+                  paste0(myq[1, 7], "(", myq[2, 7], "-", myq[3, 7], ")"),
+                  paste0(myq[1, 8], "(", myq[2, 8], "-", myq[3, 8], ")"),
+                  paste0(myq[1, 9], "(", myq[2, 9], "-", myq[3, 9], ")"),
+                  paste0(myq[1, 10], "(", myq[2, 10], "-", myq[3, 10], ")"),
+                  paste0(myq[1, 11], "(", myq[2, 11], "-", myq[3, 11], ")"),
+                  paste0(myq[1, 12], "(", myq[2, 12], "-", myq[3, 12], ")"),
+                  paste0(myq[1, 13], "(", myq[2, 13], "-", myq[3, 13], ")"),
+                  paste0(myq[1, 14], "(", myq[2, 14], "-", myq[3, 14], ")"),
+                  paste0(myq[1, 15], "(", myq[2, 15], "-", myq[3, 15], ")"),
+                  paste0(myq[1, 16], "(", myq[2, 16], "-", myq[3, 16], ")"),
+                  paste0(myq[1, 17], "(", myq[2, 17], "-", myq[3, 17], ")"),
+                  paste0(myq[1, 18], "(", myq[2, 18], "-", myq[3, 18], ")"),
+                  paste0(myq[1, 19], "(", myq[2, 19], "-", myq[3, 19], ")"),
+                  paste0(myq[1, 20], "(", myq[2, 20], "-", myq[3, 20], ")"),
+                  paste0(myq[1, 21], "(", myq[2, 21], "-", myq[3, 21], ")"),
+                  paste0(myq[1, 22], "(", myq[2, 22], "-", myq[3, 22], ")"),
+                  paste0(myq[1, 23], "(", myq[2, 23], "-", myq[3, 23], ")"),
+                  paste0(myq[1, 24], "(", myq[2, 24], "-", myq[3, 24], ")"),
+                  paste0(myq[1, 25], "(", myq[2, 25], "-", myq[3, 25], ")"),
+                  paste0(myq[1, 26], "(", myq[2, 26], "-", myq[3, 26], ")"),
+                  paste0(myq[1, 27], "(", myq[2, 27], "-", myq[3, 27], ")"),
+                  paste0(myq[1, 28], "(", myq[2, 28], "-", myq[3, 28], ")"))
+
+nombres <- c(paste0(" "),
+             paste0(equipos_names[1]),
+             paste0(equipos_names[2]),
+             paste0(equipos_names[3]),
+             paste0(equipos_names[4]),
+             paste0(equipos_names[5]),
+             paste0(equipos_names[6]),
+             paste0(equipos_names[7]),
+             paste0(equipos_names[2], " VS ", equipos_names[1]),
+             paste0(equipos_names[3], " VS ", equipos_names[1]),
+             paste0(equipos_names[4], " VS ", equipos_names[1]),
+             paste0(equipos_names[5], " VS ", equipos_names[1]),
+             paste0(equipos_names[6], " VS ", equipos_names[1]),
+             paste0(equipos_names[7], " VS ", equipos_names[1]),
+             paste0(equipos_names[3], " VS ", equipos_names[2]),
+             paste0(equipos_names[4], " VS ", equipos_names[2]),
+             paste0(equipos_names[5], " VS ", equipos_names[2]),
+             paste0(equipos_names[6], " VS ", equipos_names[2]),
+             paste0(equipos_names[7], " VS ", equipos_names[2]),
+             paste0(equipos_names[4], " VS ", equipos_names[3]),
+             paste0(equipos_names[5], " VS ", equipos_names[3]),
+             paste0(equipos_names[6], " VS ", equipos_names[3]),
+             paste0(equipos_names[7], " VS ", equipos_names[3]),
+             paste0(equipos_names[5], " VS ", equipos_names[4]),
+             paste0(equipos_names[6], " VS ", equipos_names[4]),
+             paste0(equipos_names[7], " VS ", equipos_names[4]),
+             paste0(equipos_names[6], " VS ", equipos_names[5]),
+             paste0(equipos_names[7], " VS ", equipos_names[5]),
+             paste0(equipos_names[7], " VS ", equipos_names[6]))
+
+data <- data.frame(Injury, injuries)
+tabla_eq_sinyear <- kable(data, col.names = nombres #, format = "latex"
+)
+```
+
+```{r}
+# tabla
+tabla_eq_sinyear
+# boxplot
+boxplot(IR_eq_sinyear[, 1:7])
+```
+
+##### Comparación entre los 7 mejores equipos a lo largo de los años
+
+Se cogen los datos de los 7 equipos europeos más importantes los que más veces han ganado la Champion League desde el año 1998, a lo largo de 10 años entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{FC Barcelona} + ... + \beta_6 d_{AC Mailand} + \beta_7 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{FC Barcelona} + ... + \gamma_6 d_{AC Mailand} + \gamma_7 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Reducimos los valores de year para que el modelo no sea tan costoso
+df2$year <- df2$year - 2010
+
+# Modelo
+model_equipos <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, barcelona, bayern, chelsea, liverpool, manchester, realmadrid, year)) ~ 1 + offset(log(horas100)) + barcelona + bayern + chelsea + liverpool + manchester + realmadrid + year,
+  family = "0poisson",
+  data = data.frame(injuries_total = df2$injuries_total, horas100 = df2$horas100, barcelona = equipos[[2]], bayern = equipos[[3]], chelsea = equipos[[4]], liverpool = equipos[[5]], manchester = equipos[[6]], realmadrid = equipos[[7]], year = df2$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_equipos$summary.fix, 4)
+round(model_equipos$summary.hyperpar, 4)
+
+```
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales para cada equipo en cada año
+
+```{r}
+samples_equipos <- inla.posterior.sample(n = n, 
+                                 res = model_equipos)
+
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-7]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+    x[i, 15] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 16] <- y[[i]]$hyperpar[[8]]
+  }
+  return(x)
+}
+
+esti_equipos <- matrix(NA, nrow = n, ncol = 16)
+colnames(esti_equipos) <- c("B0", "B1", "B2", "B3",
+                          "B4", "B5", "B6", "G0", "G1", "G2", 
+                          "G3", "G4", "G5", "G6", "BY", "GY")
+
+esti_equipos <- sample_estimacion(esti_equipos, samples_equipos)
+
+## Estimaciones
+
+estimaciones_equipos <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_equipos[ , 1] + esti_equipos[ , 15])
+names(lambda)[1] <- equipos_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_equipos[ , 8] + esti_equipos[ , 16])
+names(pi)[1] <- equipos_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_equipos[ , 1] + esti_equipos[ , 15]*i)
+  pi[[1]][ , i] <- expit(esti_equipos[ , 8] + esti_equipos[ , 16]*i)
+}
+
+for(j in 2:7){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_equipos[ , 1] + esti_equipos[ , j] + esti_equipos[ , 15])
+names(lambda)[j] <- equipos_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_equipos[ , 8] + esti_equipos[ , j + 7] + esti_equipos[ , 16])
+names(pi)[j] <- equipos_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_equipos[ , 1] + esti_equipos[ , j] + esti_equipos[ , 15]*i)
+  pi[[j]][ , i] <- expit(esti_equipos[ , 8] + esti_equipos[ , j + 7] + esti_equipos[ , 16]*i)
+}}
+
+for(j in 1:7){
+  estimaciones_equipos[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_equipos)[j] <- equipos_names[j]
+   for(i in 1:10){
+    estimaciones_equipos[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow =7)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_equipos)
+rownames(media_estimaciones) <- equipos_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow =7)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_equipos)
+rownames(ICl_estimaciones) <- equipos_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow =7)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_equipos)
+rownames(ICu_estimaciones) <- equipos_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_eq <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_eq)[4] <- "qL"
+colnames(datos_long_eq)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_eq, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Número de lesiones / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange", "purple", "yellow", "black")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange", "purple", "yellow", "black", "black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+#### Burden
+##### Comparación entre los 7 mejores equipos
+
+Se cogen los datos de los 7 equipos europeos más importantes, los que más veces han ganado la Champion League en los últimos 25 años, a lo largo de 10 años entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{FC Barcelona} + ... + \beta_6 d_{AC Mailand}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{FC Barcelona} + ... + \gamma_6 d_{AC Mailand}$$
+
+**Modelo**
+
+```{r, warning=FALSE}
+# Modelos
+model_equipos_sinyear_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, barcelona, bayern, chelsea, liverpool, manchester, realmadrid)) ~ 1 + offset(log(horas100)) + barcelona + bayern + chelsea + liverpool + manchester + realmadrid,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df2$days_lost_total, horas100 = df2$horas100, barcelona = equipos[[2]], bayern = equipos[[3]], chelsea = equipos[[4]], liverpool = equipos[[5]], manchester = equipos[[6]], realmadrid = equipos[[7]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_equipos_sinyear_b$summary.fix, 4)
+round(model_equipos_sinyear_b$summary.hyperpar, 4)
+```
+
+**Cálculo de IR y IRR**
+
+```{r, warning = FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_eq_sinyear_b <- inla.posterior.sample(n = n, 
+                                 res = model_equipos_sinyear_b)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+  }
+  return(x)
+}
+
+ss <- matrix(NA, nrow = n, ncol = 14)
+colnames(ss) <- c("b_equipo1", "b_equipo2", "b_equipo3", "b_equipo4", "b_equipo5", 
+                  "b_equipo6", "b_equipo7", "zi_equipo1", "zi_equipo2", "zi_equipo3", 
+                  "zi_equipo4", "zi_equipo5", "zi_equipo6", "zi_equipo7")
+
+ss <- sample_status(ss, samples_eq_sinyear_b)
+
+BR_code_eqq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 8]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 8] + y[, 9]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 8] + y[, 10]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 8] + y[, 11]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 8] + y[, 12]))
+  x[, 6] <- exp(y[, 1] + y[, 6])/(1 + exp(y[, 8] + y[, 13]))
+  x[, 7] <- exp(y[, 1] + y[, 7])/(1 + exp(y[, 8] + y[, 14]))
+  
+  # IRR entre grupos de Status
+  x[, 8] <- exp(y[, 2])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 9]))
+  x[, 9] <- exp(y[, 3])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 10]))
+  x[, 10] <- exp(y[, 4])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 11]))
+  x[, 11] <- exp(y[, 5])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 12]))
+  x[, 12] <- exp(y[, 6])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 13]))
+  x[, 13] <- exp(y[, 7])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 14]))
+  
+  x[, 14] <- (exp(y[, 3])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 10])))
+  x[, 15] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 16] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 17] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 18] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 19] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 20] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 21] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 22] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 23] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 24] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 25] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 26] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 27] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 14])))
+      
+  x[, 28] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 13] )))/(exp(y[, 6])*(1 + exp(y[, 8] + y[, 14])))
+  return(x)
+}
+
+BR_eq_sinyear <- matrix(NA, nrow = n, ncol = 28)
+colnames(BR_eq_sinyear) <- c("BR_milan", "BR_barcelona", "BR_bayern", "BR_chelsea", 
+                  "BR_liverpool", "BR_manchester", "BR_realmadrid", "BRR_e2VSe1", "BRR_e3VSe1", "BRR_e4VSe1", 
+                  "BRR_e5VSe1", "BRR_e6VSe1", "BRR_e7VSe1", "BRR_e3VSe2", "BRR_e4VSe2", "BRR_e5VSe2",
+                  "BRR_e6VSe2", "BRR_e7VSe2", "BRR_e4VSe3", "BRR_e5VSe3", "BRR_e6VSe3", "BRR_e7VSe3",
+                  "BRR_e5VSe4", "BRR_e6VSe4", "BRR_e7VSe4", "BRR_e6VSe5", "BRR_e7VSe5", "BRR_e7VSe6")
+
+BR_eq_sinyear <- BR_code_eqq(BR_eq_sinyear, ss)
+
+myq <- matrix(NA, nrow = 3, ncol = 28)
+colnames(myq) <- colnames(IR_eq_sinyear)
+rownames(myq) <- c("mean", "IC_lower", "IC_upper")
+
+myq_BR <- function(x, y){ 
+  for (i in 1:ncol(myq)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq <- myq_BR(myq, BR_eq_sinyear)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries <- cbind(paste0(myq[1, 1], "(", myq[2, 1], "-", myq[3, 1], ")"),
+                  paste0(myq[1, 2], "(", myq[2, 2], "-", myq[3, 2], ")"),
+                  paste0(myq[1, 3], "(", myq[2, 3], "-", myq[3, 3], ")"),
+                  paste0(myq[1, 4], "(", myq[2, 4], "-", myq[3, 4], ")"),
+                  paste0(myq[1, 5], "(", myq[2, 5], "-", myq[3, 5], ")"),
+                  paste0(myq[1, 6], "(", myq[2, 6], "-", myq[3, 6], ")"),
+                  paste0(myq[1, 7], "(", myq[2, 7], "-", myq[3, 7], ")"),
+                  paste0(myq[1, 8], "(", myq[2, 8], "-", myq[3, 8], ")"),
+                  paste0(myq[1, 9], "(", myq[2, 9], "-", myq[3, 9], ")"),
+                  paste0(myq[1, 10], "(", myq[2, 10], "-", myq[3, 10], ")"),
+                  paste0(myq[1, 11], "(", myq[2, 11], "-", myq[3, 11], ")"),
+                  paste0(myq[1, 12], "(", myq[2, 12], "-", myq[3, 12], ")"),
+                  paste0(myq[1, 13], "(", myq[2, 13], "-", myq[3, 13], ")"),
+                  paste0(myq[1, 14], "(", myq[2, 14], "-", myq[3, 14], ")"),
+                  paste0(myq[1, 15], "(", myq[2, 15], "-", myq[3, 15], ")"),
+                  paste0(myq[1, 16], "(", myq[2, 16], "-", myq[3, 16], ")"),
+                  paste0(myq[1, 17], "(", myq[2, 17], "-", myq[3, 17], ")"),
+                  paste0(myq[1, 18], "(", myq[2, 18], "-", myq[3, 18], ")"),
+                  paste0(myq[1, 19], "(", myq[2, 19], "-", myq[3, 19], ")"),
+                  paste0(myq[1, 20], "(", myq[2, 20], "-", myq[3, 20], ")"),
+                  paste0(myq[1, 21], "(", myq[2, 21], "-", myq[3, 21], ")"),
+                  paste0(myq[1, 22], "(", myq[2, 22], "-", myq[3, 22], ")"),
+                  paste0(myq[1, 23], "(", myq[2, 23], "-", myq[3, 23], ")"),
+                  paste0(myq[1, 24], "(", myq[2, 24], "-", myq[3, 24], ")"),
+                  paste0(myq[1, 25], "(", myq[2, 25], "-", myq[3, 25], ")"),
+                  paste0(myq[1, 26], "(", myq[2, 26], "-", myq[3, 26], ")"),
+                  paste0(myq[1, 27], "(", myq[2, 27], "-", myq[3, 27], ")"),
+                  paste0(myq[1, 28], "(", myq[2, 28], "-", myq[3, 28], ")"))
+
+nombres <- c(paste0(" "),
+             paste0(equipos_names[1]),
+             paste0(equipos_names[2]),
+             paste0(equipos_names[3]),
+             paste0(equipos_names[4]),
+             paste0(equipos_names[5]),
+             paste0(equipos_names[6]),
+             paste0(equipos_names[7]),
+             paste0(equipos_names[2], " VS ", equipos_names[1]),
+             paste0(equipos_names[3], " VS ", equipos_names[1]),
+             paste0(equipos_names[4], " VS ", equipos_names[1]),
+             paste0(equipos_names[5], " VS ", equipos_names[1]),
+             paste0(equipos_names[6], " VS ", equipos_names[1]),
+             paste0(equipos_names[7], " VS ", equipos_names[1]),
+             paste0(equipos_names[3], " VS ", equipos_names[2]),
+             paste0(equipos_names[4], " VS ", equipos_names[2]),
+             paste0(equipos_names[5], " VS ", equipos_names[2]),
+             paste0(equipos_names[6], " VS ", equipos_names[2]),
+             paste0(equipos_names[7], " VS ", equipos_names[2]),
+             paste0(equipos_names[4], " VS ", equipos_names[3]),
+             paste0(equipos_names[5], " VS ", equipos_names[3]),
+             paste0(equipos_names[6], " VS ", equipos_names[3]),
+             paste0(equipos_names[7], " VS ", equipos_names[3]),
+             paste0(equipos_names[5], " VS ", equipos_names[4]),
+             paste0(equipos_names[6], " VS ", equipos_names[4]),
+             paste0(equipos_names[7], " VS ", equipos_names[4]),
+             paste0(equipos_names[6], " VS ", equipos_names[5]),
+             paste0(equipos_names[7], " VS ", equipos_names[5]),
+             paste0(equipos_names[7], " VS ", equipos_names[6]))
+
+data <- data.frame(Injury, injuries)
+tabla_eq_sinyear_b <- kable(data, col.names = nombres #, format = "latex"
+)
+```
+
+```{r}
+# tabla
+tabla_eq_sinyear_b
+# boxplot
+boxplot(BR_eq_sinyear[, 1:7])
+```
+
+##### Comparación entre los 7 mejores equipos a lo largo de los años
+
+Se cogen los datos de los 7 equipos europeos más importantes los que más veces han ganado la Champion League desde el año 1998, a lo largo de 10 años entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{FC Barcelona} + ... + \beta_6 d_{AC Mailand} + \beta_7 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{FC Barcelona} + ... + \gamma_6 d_{AC Mailand} + \gamma_7 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Modelo
+model_equipos_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, barcelona, bayern, chelsea, liverpool, manchester, realmadrid, year)) ~ 1 + offset(log(horas100)) + barcelona + bayern + chelsea + liverpool + manchester + realmadrid + year,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df2$days_lost_total, horas100 = df2$horas100, barcelona = equipos[[2]], bayern = equipos[[3]], chelsea = equipos[[4]], liverpool = equipos[[5]], manchester = equipos[[6]], realmadrid = equipos[[7]], year = df2$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_equipos_b$summary.fix, 4)
+round(model_equipos_b$summary.hyperpar, 4)
+
+```
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales para cada equipo en cada año
+
+```{r}
+samples_equipos_b <- inla.posterior.sample(n = n, 
+                                 res = model_equipos_b)
+
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-7]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+    x[i, 15] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 16] <- y[[i]]$hyperpar[[8]]
+  }
+  return(x)
+}
+
+esti_equipos <- matrix(NA, nrow = n, ncol = 16)
+colnames(esti_equipos) <- c("B0", "B1", "B2", "B3",
+                          "B4", "B5", "B6", "G0", "G1", "G2", 
+                          "G3", "G4", "G5", "G6", "BY", "GY")
+
+esti_equipos <- sample_estimacion(esti_equipos, samples_equipos_b)
+
+## Estimaciones
+
+estimaciones_equipos_b <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_equipos[ , 1] + esti_equipos[ , 15])
+names(lambda)[1] <- equipos_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_equipos[ , 8] + esti_equipos[ , 16])
+names(pi)[1] <- equipos_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_equipos[ , 1] + esti_equipos[ , 15]*i)
+  pi[[1]][ , i] <- expit(esti_equipos[ , 8] + esti_equipos[ , 16]*i)
+}
+
+for(j in 2:7){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_equipos[ , 1] + esti_equipos[ , j] + esti_equipos[ , 15])
+names(lambda)[j] <- equipos_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_equipos[ , 8] + esti_equipos[ , j + 7] + esti_equipos[ , 16])
+names(pi)[j] <- equipos_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_equipos[ , 1] + esti_equipos[ , j] + esti_equipos[ , 15]*i)
+  pi[[j]][ , i] <- expit(esti_equipos[ , 8] + esti_equipos[ , j + 7] + esti_equipos[ , 16]*i)
+}}
+
+for(j in 1:7){
+  estimaciones_equipos_b[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_equipos_b)[j] <- equipos_names[j]
+   for(i in 1:10){
+    estimaciones_equipos_b[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow =7)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_equipos_b)
+rownames(media_estimaciones) <- equipos_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow =7)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_equipos_b)
+rownames(ICl_estimaciones) <- equipos_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow =7)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_equipos_b)
+rownames(ICu_estimaciones) <- equipos_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_eq <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_eq)[4] <- "qL"
+colnames(datos_long_eq)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_eq, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Días perdidos totales / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange", "purple", "yellow", "black")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange", "purple", "yellow", "black", "black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+### Posiciones
+
+#### Incidence
+##### Comparación entre posiciones en el campo
+
+Se cogen los datos de las 4 posiciones de los todos los equipos europeos a lo largo de 10 años, entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Defender} + ... + \beta_3 d_{Midfielder}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Defender} + ... + \gamma_3 d_{Midfielder}$$
+
+**Modelo**
+
+```{r}
+df3 <- players_all_league_criterio[players_all_league_criterio$year >= 2011 & players_all_league_criterio$year <= 2020, ]
+df3$position2 <- as.factor(df3$position2)
+position_names <- levels(df3$position2)
+
+position <- list()
+for(i in 1:length(position_names)){
+  nombre <- position_names[i]
+  position[[nombre]] <- as.numeric(df3$position2)
+  position[[nombre]][df3$position2 == nombre] <- 1
+  position[[nombre]][df3$position2 != nombre] <- 0
+}
+
+# Modelo
+model_posicion_sinyear <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, defender, goalkeeper, midfielder)) ~ 1 + offset(log(horas100)) + defender + goalkeeper + midfielder,
+  family = "0poisson",
+  data = data.frame(injuries_total = df3$injuries_total, horas100 = df3$horas100, defender = position[[2]], goalkeeper = position[[3]], midfielder = position[[4]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_posicion_sinyear$summary.fix, 4)
+round(model_posicion_sinyear$summary.hyperpar, 4)
+``` 
+
+**Cálculo de IR y IRR**
+
+```{r, warning=FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_position_sinyear <- inla.posterior.sample(n = n, 
+                                 res = model_posicion_sinyear)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 5] <- y[[i]]$hyperpar[[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[2]]
+    x[i, 7] <- y[[i]]$hyperpar[[3]]
+    x[i, 8] <- y[[i]]$hyperpar[[4]]
+  }
+  return(x)
+}
+
+ss_position <- matrix(NA, nrow = n, ncol = 8)
+colnames(ss_position) <- c("b_Forward", "b_Defender", "b_Goalkeeper",
+                        "b_Midfielder", "zi_Forward", "zi_Defender",
+                        "zi_Goalkeeper", "zi_Midfielder")
+
+ss_position <- sample_status(ss_position, samples_position_sinyear)
+
+IR_code_po <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 5]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 5] + y[, 6]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 5] + y[, 7]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 5] + y[, 8]))
+  
+  # IRR entre grupos de Status
+  x[, 5] <- exp(y[, 2])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 6]))
+  x[, 6] <- exp(y[, 3])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 7]))
+  x[, 7] <- exp(y[, 4])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 8]))
+
+  
+  x[, 8] <- (exp(y[, 3])*(1 + exp(y[, 5] + y[, 6])))/(exp(y[, 2])*(1 + exp(y[, 5] + y[, 7])))
+  x[, 9] <- (exp(y[, 4])*(1 + exp(y[, 5] + y[, 6])))/(exp(y[, 2])*(1 + exp(y[, 5] + y[, 8])))
+  
+  x[, 10] <- (exp(y[, 4])*(1 + exp(y[, 5] + y[, 7] )))/(exp(y[, 3])*(1 + exp(y[, 5] + y[, 8])))
+
+  return(x)
+}
+
+IR_position_interaccion <- matrix(NA, nrow = n, ncol = 10)
+colnames(IR_position_interaccion) <- c("IR_Forward", "IR_Defender", "IR_Goalkeeper", "IR_Midfielder", 
+                  "IRR_DefVSForw", "IRR_GoaVSForw", "IRR_MidVSForw", 
+                  "IRR_GoaVSDef", "IRR_MidVSDef", "IRR_MidVSGoa")
+
+IR_position_interaccion <- IR_code_po(IR_position_interaccion, ss_position)
+
+myq_position <- matrix(NA, nrow = 3, ncol = 10)
+colnames(myq_position) <- colnames(IR_position_interaccion)
+rownames(myq_position) <- c("mean", "IC_lower", "IC_upper")
+
+myq_IR <- function(x, y){ 
+  for (i in 1:ncol(myq_position)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq_position <- myq_IR(myq_position, IR_position_interaccion)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries_position <- cbind(paste0(myq_position[1, 1], "(", myq_position[2, 1], "-", myq_position[3, 1], ")"),
+                       paste0(myq_position[1, 2], "(", myq_position[2, 2], "-", myq_position[3, 2], ")"),
+                       paste0(myq_position[1, 3], "(", myq_position[2, 3], "-", myq_position[3, 3], ")"),
+                       paste0(myq_position[1, 4], "(", myq_position[2, 4], "-", myq_position[3, 4], ")"),
+                       paste0(myq_position[1, 5], "(", myq_position[2, 5], "-", myq_position[3, 5], ")"),
+                       paste0(myq_position[1, 6], "(", myq_position[2, 6], "-", myq_position[3, 6], ")"),
+                       paste0(myq_position[1, 7], "(", myq_position[2, 7], "-", myq_position[3, 7], ")"),
+                       paste0(myq_position[1, 8], "(", myq_position[2, 8], "-", myq_position[3, 8], ")"),
+                       paste0(myq_position[1, 9], "(", myq_position[2, 9], "-", myq_position[3, 9], ")"),
+                       paste0(myq_position[1, 10], "(", myq_position[2, 10], "-", myq_position[3, 10], ")"))
+
+nombres_position <- c(paste0(" "),
+             paste0(position_names[1]),
+             paste0(position_names[2]),
+             paste0(position_names[3]),
+             paste0(position_names[4]),
+             paste0(position_names[2], " VS ", position_names[1]),
+             paste0(position_names[3], " VS ", position_names[1]),
+             paste0(position_names[4], " VS ", position_names[1]),
+             paste0(position_names[3], " VS ", position_names[2]),
+             paste0(position_names[4], " VS ", position_names[2]),
+             paste0(position_names[4], " VS ", position_names[3]))
+
+data_position <- data.frame(Injury, injuries_position)
+tabla_position <- kable(data_position, col.names = nombres_position #, format = "latex"
+)
+
+```
+
+```{r}
+# tabla
+tabla_position
+# boxplot
+boxplot(IR_position_interaccion[, 1:4])
+```
+
+
+##### Comparación entre posiciones en el campo a lo largo de los años
+
+Se cogen los datos de las 4 posiciones de los todos los equipos europeos a lo largo de 10 años, entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Defender} + ... + \beta_3 d_{Midfielder} + \beta_4 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Defender} + ... + \gamma_3 d_{Midfielder} + \gamma_4 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Reducimos los valores de year para que el modelo no sea tan costoso
+df3$year <- df3$year - 2010
+
+# Modelo
+model_posicion <- inla(
+  inla.mdata(cbind(injuries_total, 1), cbind(1, defender, goalkeeper, midfielder, year)) ~ 1 + offset(log(horas100)) + defender + goalkeeper + midfielder + year,
+  family = "0poisson",
+  data = data.frame(injuries_total = df3$injuries_total, horas100 = df3$horas100, defender = position[[2]], goalkeeper = position[[3]], midfielder = position[[4]], year = df3$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_posicion$summary.fix, 4)
+round(model_posicion$summary.hyperpar, 4)
+
+``` 
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales para cada posición en cada año
+
+```{r}
+samples_posicion <- inla.posterior.sample(n = n, 
+                                 res = model_posicion)
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 5] <- y[[i]]$hyperpar[[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[2]]
+    x[i, 7] <- y[[i]]$hyperpar[[3]]
+    x[i, 8] <- y[[i]]$hyperpar[[4]]
+    x[i, 9] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+  }
+  return(x)
+}
+
+esti_posicion <- matrix(NA, nrow = n, ncol = 10)
+colnames(esti_posicion) <- c("B0", "B1", "B2", "B3", "G0", "G1", "G2", 
+                          "G3", "BY", "GY")
+
+esti_posicion <- sample_estimacion(esti_posicion, samples_posicion)
+
+## Estimaciones
+
+estimaciones_posicion <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_posicion[ , 1] + esti_posicion[ , 9])
+names(lambda)[1] <- position_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_posicion[ , 5] + esti_posicion[ , 10])
+names(pi)[1] <- position_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_posicion[ , 1] + esti_posicion[ , 9]*i)
+  pi[[1]][ , i] <- expit(esti_posicion[ , 5] + esti_posicion[ , 10]*i)
+}
+
+for(j in 2:4){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_posicion[ , 1] + esti_posicion[ , j] + esti_posicion[ , 9])
+names(lambda)[j] <- position_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_posicion[ , 5] + esti_posicion[ , j + 4] + esti_posicion[ , 10])
+names(pi)[j] <- position_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_posicion[ , 1] + esti_posicion[ , j] + esti_posicion[ , 9]*i)
+  pi[[j]][ , i] <- expit(esti_posicion[ , 5] + esti_posicion[ , j + 4] + esti_posicion[ , 10]*i)
+}}
+
+for(j in 1:4){
+  estimaciones_posicion[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_posicion)[j] <- position_names[j]
+   for(i in 1:10){
+    estimaciones_posicion[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow = 4)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_posicion)
+rownames(media_estimaciones) <- position_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow = 4)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_posicion)
+rownames(ICl_estimaciones) <- position_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow = 4)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_posicion)
+rownames(ICu_estimaciones) <- position_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estiamciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_po <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_po)[4] <- "qL"
+colnames(datos_long_po)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_po, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Número de lesiones / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange","black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+#### Burden
+##### Comparación entre posiciones en el campo
+
+Se cogen los datos de las 4 posiciones de los todos los equipos europeos a lo largo de 10 años, entre 2011 y 2020.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Defender} + ... + \beta_3 d_{Midfielder}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Defender} + ... + \gamma_3 d_{Midfielder}$$
+
+**Modelo**
+
+```{r}
+# Modelo
+model_posicion_sinyear_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, defender, goalkeeper, midfielder)) ~ 1 + offset(log(horas100)) + defender + goalkeeper + midfielder,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df3$days_lost_total, horas100 = df3$horas100, defender = position[[2]], goalkeeper = position[[3]], midfielder = position[[4]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_posicion_sinyear_b$summary.fix, 4)
+round(model_posicion_sinyear_b$summary.hyperpar, 4)
+``` 
+
+**Cálculo de IR y IRR**
+
+```{r, warning=FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_position_sinyear_b <- inla.posterior.sample(n = n, 
+                                 res = model_posicion_sinyear_b)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 5] <- y[[i]]$hyperpar[[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[2]]
+    x[i, 7] <- y[[i]]$hyperpar[[3]]
+    x[i, 8] <- y[[i]]$hyperpar[[4]]
+  }
+  return(x)
+}
+
+ss_position <- matrix(NA, nrow = n, ncol = 8)
+colnames(ss_position) <- c("b_Forward", "b_Defender", "b_Goalkeeper",
+                        "b_Midfielder", "zi_Forward", "zi_Defender",
+                        "zi_Goalkeeper", "zi_Midfielder")
+
+ss_position <- sample_status(ss_position, samples_position_sinyear_b)
+
+BR_code_po <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 5]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 5] + y[, 6]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 5] + y[, 7]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 5] + y[, 8]))
+  
+  # IRR entre grupos de Status
+  x[, 5] <- exp(y[, 2])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 6]))
+  x[, 6] <- exp(y[, 3])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 7]))
+  x[, 7] <- exp(y[, 4])*(1 + exp(y[, 5]))/(1 + exp(y[, 5] + y[, 8]))
+
+  
+  x[, 8] <- (exp(y[, 3])*(1 + exp(y[, 5] + y[, 6])))/(exp(y[, 2])*(1 + exp(y[, 5] + y[, 7])))
+  x[, 9] <- (exp(y[, 4])*(1 + exp(y[, 5] + y[, 6])))/(exp(y[, 2])*(1 + exp(y[, 5] + y[, 8])))
+  
+  x[, 10] <- (exp(y[, 4])*(1 + exp(y[, 5] + y[, 7] )))/(exp(y[, 3])*(1 + exp(y[, 5] + y[, 8])))
+
+  return(x)
+}
+
+BR_position_interaccion <- matrix(NA, nrow = n, ncol = 10)
+colnames(BR_position_interaccion) <- c("BR_Forward", "BR_Defender", "BR_Goalkeeper", "BR_Midfielder", 
+                  "BRR_DefVSForw", "BRR_GoaVSForw", "BRR_MidVSForw", 
+                  "BRR_GoaVSDef", "BRR_MidVSDef", "BRR_MidVSGoa")
+
+BR_position_interaccion <- BR_code_po(BR_position_interaccion, ss_position)
+
+myq_position <- matrix(NA, nrow = 3, ncol = 10)
+colnames(myq_position) <- colnames(BR_position_interaccion)
+rownames(myq_position) <- c("mean", "IC_lower", "IC_upper")
+
+myq_BR <- function(x, y){ 
+  for (i in 1:ncol(myq_position)){
+    x[1, i] <- round(mean(y[, i]), 4)
+    x[2, i] <- round(quantile(y[, i], 0.025), 4)
+    x[3, i] <- round(quantile(y[, i], 0.975), 4)
+  }
+  return(x)
+}
+
+myq_position <- myq_BR(myq_position, BR_position_interaccion)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries_position <- cbind(paste0(myq_position[1, 1], "(", myq_position[2, 1], "-", myq_position[3, 1], ")"),
+                       paste0(myq_position[1, 2], "(", myq_position[2, 2], "-", myq_position[3, 2], ")"),
+                       paste0(myq_position[1, 3], "(", myq_position[2, 3], "-", myq_position[3, 3], ")"),
+                       paste0(myq_position[1, 4], "(", myq_position[2, 4], "-", myq_position[3, 4], ")"),
+                       paste0(myq_position[1, 5], "(", myq_position[2, 5], "-", myq_position[3, 5], ")"),
+                       paste0(myq_position[1, 6], "(", myq_position[2, 6], "-", myq_position[3, 6], ")"),
+                       paste0(myq_position[1, 7], "(", myq_position[2, 7], "-", myq_position[3, 7], ")"),
+                       paste0(myq_position[1, 8], "(", myq_position[2, 8], "-", myq_position[3, 8], ")"),
+                       paste0(myq_position[1, 9], "(", myq_position[2, 9], "-", myq_position[3, 9], ")"),
+                       paste0(myq_position[1, 10], "(", myq_position[2, 10], "-", myq_position[3, 10], ")"))
+
+nombres_position <- c(paste0(" "),
+             paste0(position_names[1]),
+             paste0(position_names[2]),
+             paste0(position_names[3]),
+             paste0(position_names[4]),
+             paste0(position_names[2], " VS ", position_names[1]),
+             paste0(position_names[3], " VS ", position_names[1]),
+             paste0(position_names[4], " VS ", position_names[1]),
+             paste0(position_names[3], " VS ", position_names[2]),
+             paste0(position_names[4], " VS ", position_names[2]),
+             paste0(position_names[4], " VS ", position_names[3]))
+
+data_position <- data.frame(Injury, injuries_position)
+tabla_position_b <- kable(data_position, col.names = nombres_position #, format = "latex"
+)
+
+```
+
+```{r}
+# tabla
+tabla_position_b
+# boxplot
+boxplot(BR_position_interaccion[, 1:4])
+```
+
+##### Comparación entre posiciones en el campo a lo largo de los años
+
+Se cogen los datos de las 4 posiciones de los todos los equipos europeos a lo largo de 10 años, entre 2011 y 2020. Se introduce la variable year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Defender} + ... + \beta_3 d_{Midfielder} + \beta_4 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Defender} + ... + \gamma_3 d_{Midfielder} + \gamma_4 X_{year}$$
+
+**Modelo**
+
+```{r}
+# Modelo
+model_posicion_b <- inla(
+  inla.mdata(cbind(days_lost_total, 1), cbind(1, defender, goalkeeper, midfielder, year)) ~ 1 + offset(log(horas100)) + defender + goalkeeper + midfielder + year,
+  family = "0poisson",
+  data = data.frame(days_lost_total = df3$days_lost_total, horas100 = df3$horas100, defender = position[[2]], goalkeeper = position[[3]], midfielder = position[[4]], year = df3$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_posicion_b$summary.fix, 4)
+round(model_posicion_b$summary.hyperpar, 4)
+
+``` 
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales para cada posición en cada año
+
+```{r}
+samples_posicion_b <- inla.posterior.sample(n = n, 
+                                 res = model_posicion_b)
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 5] <- y[[i]]$hyperpar[[1]]
+    x[i, 6] <- y[[i]]$hyperpar[[2]]
+    x[i, 7] <- y[[i]]$hyperpar[[3]]
+    x[i, 8] <- y[[i]]$hyperpar[[4]]
+    x[i, 9] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 10] <- y[[i]]$hyperpar[[5]]
+  }
+  return(x)
+}
+
+esti_posicion <- matrix(NA, nrow = n, ncol = 10)
+colnames(esti_posicion) <- c("B0", "B1", "B2", "B3", "G0", "G1", "G2", 
+                          "G3", "BY", "GY")
+
+esti_posicion <- sample_estimacion(esti_posicion, samples_posicion_b)
+
+## Estimaciones
+
+estimaciones_posicion_b <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_posicion[ , 1] + esti_posicion[ , 9])
+names(lambda)[1] <- position_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_posicion[ , 5] + esti_posicion[ , 10])
+names(pi)[1] <- position_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_posicion[ , 1] + esti_posicion[ , 9]*i)
+  pi[[1]][ , i] <- expit(esti_posicion[ , 5] + esti_posicion[ , 10]*i)
+}
+
+for(j in 2:4){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_posicion[ , 1] + esti_posicion[ , j] + esti_posicion[ , 9])
+names(lambda)[j] <- position_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_posicion[ , 5] + esti_posicion[ , j + 4] + esti_posicion[ , 10])
+names(pi)[j] <- position_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_posicion[ , 1] + esti_posicion[ , j] + esti_posicion[ , 9]*i)
+  pi[[j]][ , i] <- expit(esti_posicion[ , 5] + esti_posicion[ , j + 4] + esti_posicion[ , 10]*i)
+}}
+
+for(j in 1:4){
+  estimaciones_posicion_b[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_posicion_b)[j] <- position_names[j]
+   for(i in 1:10){
+    estimaciones_posicion_b[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow = 4)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_posicion_b)
+rownames(media_estimaciones) <- position_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow = 4)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_posicion_b)
+rownames(ICl_estimaciones) <- position_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:4){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow = 4)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_posicion_b)
+rownames(ICu_estimaciones) <- position_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_po <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_po)[4] <- "qL"
+colnames(datos_long_po)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_po, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Días perdidos totales / 100 h jugadas") +
+  scale_color_manual(values = c("red", "blue", "green", "orange")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange","black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+### Lesiones
+
+#### Comparación entre las 7 lesiones más frecuentes
+
+Se cogen los datos de las 7 lesiones más frecuentes (justificado bibliograficamente 10R) que sufren los fútbolistas, a lo largo de 10 años entre las temporadas 11/12 y 20/21.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Concussion} + ... + \beta_6 d_{Knee}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Concussion} + ... + \gamma_6 d_{Knee}$$
+
+**Modelo**
+
+```{r}
+lesiones <- c("Hamstring Injury", "Muscle Injury", "Ankle Injury", "Knee Injury", "Shoulder Injury", "Calf Injury", "Foot Injury")
+seasons <- c("11/12", "12/13", "13/14", "14/15", "15/16", "16/17", "17/18", "18/19", "19/20", "20/21")
+df4 <- injuries_all_league[injuries_all_league$injury %in% lesiones & injuries_all_league$season %in% seasons, ]
+df4$injury <- as.factor(df4$injury)
+lesiones_names <- levels(df4$injury)
+
+lesiones <- list()
+for(i in 1:length(lesiones_names)){
+  nombre <- lesiones_names[i]
+  lesiones[[nombre]] <- as.numeric(df4$injury)
+  lesiones[[nombre]][df4$injury == nombre] <- 1
+  lesiones[[nombre]][df4$injury != nombre] <- 0
+}
+
+# Modelo ZIP
+model_lesiones_sinseason <- inla(
+  inla.mdata(cbind(days_missed, 1), cbind(1, calf, foot, hamstring, knee, muscle, shoulder)) ~ 1 + calf + foot + hamstring + knee + muscle + shoulder,
+  family = "0poisson",
+  data = data.frame(days_missed = df4$days_missed, calf = lesiones[[2]], foot = lesiones[[3]], hamstring = lesiones[[4]], knee = lesiones[[5]], muscle = lesiones[[6]], shoulder = lesiones[[7]]),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_lesiones_sinseason$summary.fix, 4)
+round(model_lesiones_sinseason$summary.hyperpar, 4)
+round(model_lesiones_sinseason_p$summary.fix, 4)
+
+# Modelo POISSON
+model_lesiones_sinseason_p <- inla(days_missed ~ injury,
+  family = "poisson",
+  data = data.frame(days_missed = df4$days_missed, injury = df4$injury),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_lesiones_sinseason_p$summary.fix, 4)
+
+model_lesiones_sinseason$waic$waic
+model_lesiones_sinseason_p$waic$waic
+
+```
+
+**Cálculo del IR y IRR**
+
+```{r, warning=FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_les_sinseason <- inla.posterior.sample(n = n, 
+                                 res = model_lesiones_sinseason)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+  }
+  return(x)
+}
+
+ss <- matrix(NA, nrow = n, ncol = 14)
+colnames(ss) <- c("b_lesion1", "b_lesion2", "b_lesion3", "b_lesion4", "b_lesion5", 
+                  "b_lesion6", "b_lesion7", "zi_lesion1", "zi_lesion2", "zi_lesion3", 
+                  "zi_lesion4", "zi_lesion5", "zi_lesion6", "zi_lesion7")
+
+ss <- sample_status(ss, samples_les_sinseason)
+
+IR_code_eqq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 8]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 8] + y[, 9]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 8] + y[, 10]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 8] + y[, 11]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 8] + y[, 12]))
+  x[, 6] <- exp(y[, 1] + y[, 6])/(1 + exp(y[, 8] + y[, 13]))
+  x[, 7] <- exp(y[, 1] + y[, 7])/(1 + exp(y[, 8] + y[, 14]))
+  
+  # IRR entre grupos de Status
+  x[, 8] <- exp(y[, 2])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 9]))
+  x[, 9] <- exp(y[, 3])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 10]))
+  x[, 10] <- exp(y[, 4])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 11]))
+  x[, 11] <- exp(y[, 5])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 12]))
+  x[, 12] <- exp(y[, 6])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 13]))
+  x[, 13] <- exp(y[, 7])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 14]))
+  
+  x[, 14] <- (exp(y[, 3])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 10])))
+  x[, 15] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 16] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 17] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 18] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 19] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 20] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 21] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 22] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 23] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 24] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 25] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 26] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 27] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 14])))
+      
+  x[, 28] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 13] )))/(exp(y[, 6])*(1 + exp(y[, 8] + y[, 14])))
+  return(x)
+}
+
+IR_les_sinseason <- matrix(NA, nrow = n, ncol = 28)
+colnames(IR_les_sinseason) <- c("IR_ankle", "IR_calf", "IR_foot", "IR_hamstring", 
+                  "IR_knee", "IR_muscle", "IR_shoulder", "IRR_e2VSe1", "IRR_e3VSe1", "IRR_e4VSe1", 
+                  "IRR_e5VSe1", "IRR_e6VSe1", "IRR_e7VSe1", "IRR_e3VSe2", "IRR_e4VSe2", "IRR_e5VSe2",
+                  "IRR_e6VSe2", "IRR_e7VSe2", "IRR_e4VSe3", "IRR_e5VSe3", "IRR_e6VSe3", "IRR_e7VSe3",
+                  "IRR_e5VSe4", "IRR_e6VSe4", "IRR_e7VSe4", "IRR_e6VSe5", "IRR_e7VSe5", "IRR_e7VSe6")
+
+IR_les_sinseason <- IR_code_eqq(IR_les_sinseason, ss)
+
+myq <- matrix(NA, nrow = 3, ncol = 28)
+colnames(myq) <- colnames(IR_les_sinseason)
+rownames(myq) <- c("mean", "IC_lower", "IC_upper")
+
+myq_IR <- function(x, y){ 
+  for (i in 1:ncol(myq)){
+    x[1, i] <- round(mean(y[, i]), 2)
+    x[2, i] <- round(quantile(y[, i], 0.025), 2)
+    x[3, i] <- round(quantile(y[, i], 0.975), 2)
+  }
+  return(x)
+}
+
+myq <- myq_IR(myq, IR_les_sinseason)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries <- cbind(paste0(myq[1, 1], "(", myq[2, 1], "-", myq[3, 1], ")"),
+                  paste0(myq[1, 2], "(", myq[2, 2], "-", myq[3, 2], ")"),
+                  paste0(myq[1, 3], "(", myq[2, 3], "-", myq[3, 3], ")"),
+                  paste0(myq[1, 4], "(", myq[2, 4], "-", myq[3, 4], ")"),
+                  paste0(myq[1, 5], "(", myq[2, 5], "-", myq[3, 5], ")"),
+                  paste0(myq[1, 6], "(", myq[2, 6], "-", myq[3, 6], ")"),
+                  paste0(myq[1, 7], "(", myq[2, 7], "-", myq[3, 7], ")"),
+                  paste0(myq[1, 8], "(", myq[2, 8], "-", myq[3, 8], ")"),
+                  paste0(myq[1, 9], "(", myq[2, 9], "-", myq[3, 9], ")"),
+                  paste0(myq[1, 10], "(", myq[2, 10], "-", myq[3, 10], ")"),
+                  paste0(myq[1, 11], "(", myq[2, 11], "-", myq[3, 11], ")"),
+                  paste0(myq[1, 12], "(", myq[2, 12], "-", myq[3, 12], ")"),
+                  paste0(myq[1, 13], "(", myq[2, 13], "-", myq[3, 13], ")"),
+                  paste0(myq[1, 14], "(", myq[2, 14], "-", myq[3, 14], ")"),
+                  paste0(myq[1, 15], "(", myq[2, 15], "-", myq[3, 15], ")"),
+                  paste0(myq[1, 16], "(", myq[2, 16], "-", myq[3, 16], ")"),
+                  paste0(myq[1, 17], "(", myq[2, 17], "-", myq[3, 17], ")"),
+                  paste0(myq[1, 18], "(", myq[2, 18], "-", myq[3, 18], ")"),
+                  paste0(myq[1, 19], "(", myq[2, 19], "-", myq[3, 19], ")"),
+                  paste0(myq[1, 20], "(", myq[2, 20], "-", myq[3, 20], ")"),
+                  paste0(myq[1, 21], "(", myq[2, 21], "-", myq[3, 21], ")"),
+                  paste0(myq[1, 22], "(", myq[2, 22], "-", myq[3, 22], ")"),
+                  paste0(myq[1, 23], "(", myq[2, 23], "-", myq[3, 23], ")"),
+                  paste0(myq[1, 24], "(", myq[2, 24], "-", myq[3, 24], ")"),
+                  paste0(myq[1, 25], "(", myq[2, 25], "-", myq[3, 25], ")"),
+                  paste0(myq[1, 26], "(", myq[2, 26], "-", myq[3, 26], ")"),
+                  paste0(myq[1, 27], "(", myq[2, 27], "-", myq[3, 27], ")"),
+                  paste0(myq[1, 28], "(", myq[2, 28], "-", myq[3, 28], ")"))
+
+nombres <- c(paste0(" "),
+             paste0(lesiones_names[1]),
+             paste0(lesiones_names[2]),
+             paste0(lesiones_names[3]),
+             paste0(lesiones_names[4]),
+             paste0(lesiones_names[5]),
+             paste0(lesiones_names[6]),
+             paste0(lesiones_names[7]),
+             paste0(lesiones_names[2], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[3], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[3], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[5]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[5]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[6]))
+
+data_les <- data.frame(Injury, injuries)
+tabla_les_sinseason <- kable(data_les, col.names = nombres #, format = "latex"
+)
+```
+
+```{r}
+# tabla
+tabla_les_sinseason
+# boxplot
+boxplot(IR_les_sinseason[, 1:7])
+```
+
+
+#### Comparación entre las 7 lesiones más frecuentes a lo largo de los años
+
+Se cogen los datos de las 7 lesiones más frecuentes (justificado bibliograficamente 10R) que sufren los fútbolistas, a lo largo de 10 años entre 2011 y 2020. Se introduce la varible year como variable explicativa en el modelo.
+
+Las ecuaciones del modelo serán las siguientes:
+
+  - Predictor lineal Poisson,
+
+$$log(\lambda) = \beta_0 + \beta_1 d_{Concussion} + ... + \beta_6 d_{Knee} + \beta_7 X_{year}$$
+
+  - Predictor lineal Bernoulli,
+
+$$logit(\pi) = \gamma_0 + \gamma_1 d_{Concussion} + ... + \gamma_6 d_{Knee} + \gamma_7 X_{year}$$
+
+**Modelo**
+
+```{r}
+df4$year <- as.integer(df4$year)
+df4$year <- df4$year - 2010
+
+# Modelo
+model_lesiones <- inla(
+  inla.mdata(cbind(days_missed, 1), cbind(1, calf, foot, hamstring, knee, muscle, shoulder, year)) ~ 1 + calf + foot + hamstring + knee + muscle + shoulder + year,
+  family = "0poisson",
+  data = data.frame(days_missed = df4$days_missed, calf = lesiones[[2]], foot = lesiones[[3]], hamstring = lesiones[[4]], knee = lesiones[[5]], muscle = lesiones[[6]], shoulder = lesiones[[7]], year = df4$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)),
+                                     beta2 = list(param = c(0, 1)),
+                                     beta3 = list(param = c(0, 1)),
+                                     beta4 = list(param = c(0, 1)),
+                                     beta5 = list(param = c(0, 1)),
+                                     beta6 = list(param = c(0, 1)),
+                                     beta7 = list(param = c(0, 1)))))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_lesiones$summary.fix, 4)
+round(model_lesiones$summary.hyperpar, 4)
+
+```
+
+**Estimaciones**
+
+Calculamos la estimación de la variable respuesta, número de lesiones totales para cada tipo de lesión en cada año
+
+```{r}
+samples_lesiones <- inla.posterior.sample(n = n, 
+                                 res = model_lesiones)
+
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-7]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+    x[i, 15] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 16] <- y[[i]]$hyperpar[[8]]
+  }
+  return(x)
+}
+
+esti_lesiones <- matrix(NA, nrow = n, ncol = 16)
+colnames(esti_lesiones) <- c("B0", "B1", "B2", "B3",
+                          "B4", "B5", "B6", "G0", "G1", "G2", 
+                          "G3", "G4", "G5", "G6", "BY", "GY")
+
+esti_lesiones <- sample_estimacion(esti_lesiones, samples_lesiones)
+
+## Estimaciones
+
+estimaciones_lesiones <- list()
+lambda <- list()
+pi <- list()
+
+lambda[[1]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[1]][ , 1] <- exp(esti_lesiones[ , 1] + esti_lesiones[ , 15])
+names(lambda)[1] <- lesiones_names[1]
+
+pi[[1]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[1]][ , 1] <- expit(esti_lesiones[ , 8] + esti_lesiones[ , 16])
+names(pi)[1] <- lesiones_names[1]
+
+for(i in 2:10){
+  lambda[[1]][ , i] <- exp(esti_lesiones[ , 1] + esti_lesiones[ , 15]*i)
+  pi[[1]][ , i] <- expit(esti_lesiones[ , 8] + esti_lesiones[ , 16]*i)
+}
+
+for(j in 2:7){
+lambda[[j]] <- matrix(NA, ncol = 10, nrow = n)
+lambda[[j]][ , 1] <- exp(esti_lesiones[ , 1] + esti_lesiones[ , j] + esti_lesiones[ , 15])
+names(lambda)[j] <- lesiones_names[j]
+pi[[j]] <- matrix(NA, ncol = 10, nrow = n)
+pi[[j]][ , 1] <- expit(esti_lesiones[ , 8] + esti_lesiones[ , j + 7] + esti_lesiones[ , 16])
+names(pi)[j] <- lesiones_names[j]
+
+for(i in 2:10){
+  lambda[[j]][ , i] <- exp(esti_lesiones[ , 1] + esti_lesiones[ , j] + esti_lesiones[ , 15]*i)
+  pi[[j]][ , i] <- expit(esti_lesiones[ , 8] + esti_lesiones[ , j + 7] + esti_lesiones[ , 16]*i)
+}}
+
+for(j in 1:7){
+  estimaciones_lesiones[[j]] <- matrix(NA, ncol = 10, nrow = n)
+  names(estimaciones_lesiones)[j] <- lesiones_names[j]
+   for(i in 1:10){
+    estimaciones_lesiones[[j]][ , i] <- (1 - pi[[j]][ , i]) * lambda[[j]][ , i]
+  }
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- mean(y[[j]][ , i])
+  }}
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow =7)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_lesiones)
+rownames(media_estimaciones) <- lesiones_names
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.025)
+  }}
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow =7)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_lesiones)
+rownames(ICl_estimaciones) <- lesiones_names
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    for(j in 1:7){
+    x[j, i] <- quantile(y[[j]][ , i], 0.975)
+  }}
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow =7)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_lesiones)
+rownames(ICu_estimaciones) <- lesiones_names
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_le <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_le)[4] <- "qL"
+colnames(datos_long_le)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_le, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Número de dias perdidos") +
+  scale_color_manual(values = c("red", "blue", "green", "orange", "purple", "yellow", "black")) +
+  scale_fill_manual(values=c("red", "blue", "green", "orange", "purple", "yellow", "black", "black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+### Hamstring
+#### Estudio de los días totales perdidos debido a la lesión Hamstring
+
+Las ecuaciones del modelo serán las siguientes:
+
+$$log(\lambda) = \beta_0 + \beta_1 X_{year}$$
+
+$$logit(\pi) = \gamma_0 + \gamma_1 X_{year}$$
+
+**Modelo** 
+
+```{r}
+df_hamstring <- injuries_all_league[(injuries_all_league$injury == "Hamstring Injury"), ] %>% droplevels()
+df_hamstring <- df_hamstring[df_hamstring$year >= "2011" & df_hamstring$year <= "2020", ] %>% droplevels()
+
+df_hamstring$year <- as.integer(df_hamstring$year)
+df_hamstring$year <- df_hamstring$year - 2010
+
+# Modelo
+model_hamstring <- inla(
+  inla.mdata(cbind(days_missed, 1), cbind(1, year)) ~ 1 + year,
+  family = "0poisson",
+  data = data.frame(days_missed = df_hamstring$days_missed, year = df_hamstring$year),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE),
+  control.family = list(hyper = list(beta1 = list(param = c(0, 1)))))
+
+model_hamstring$summary.fixed
+model_hamstring$summary.hyperpar
+```
+
+**Estimaciones**
+
+```{r}
+samples_hamstring <- inla.posterior.sample(n = n, 
+                                 res = model_hamstring)
+sample_estimacion <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 3] <- y[[i]]$hyperpar[[1]]
+    x[i, 4] <- y[[i]]$hyperpar[[2]]
+  }
+  return(x)
+}
+
+esti_hamstring <- matrix(NA, nrow = n, ncol = 4)
+colnames(esti_hamstring) <- c("B0", "BY", "G0", "GY")
+
+esti_hamstring <- sample_estimacion(esti_hamstring, samples_hamstring)
+
+## Estimaciones
+
+estimaciones_hamstring <- matrix(NA, ncol = 10, nrow = n)
+
+lambda <- matrix(NA, ncol = 10, nrow = n)
+lambda[ , 1] <- exp(esti_hamstring[ , 1] + esti_hamstring[ , 2])
+
+pi <- matrix(NA, ncol = 10, nrow = n)
+pi[ , 1] <- expit(esti_hamstring[ , 3] + esti_hamstring[ , 4])
+
+for(i in 2:10){
+  lambda[ , i] <- exp(esti_hamstring[ , 1] + esti_hamstring[ , 2]*i)
+  pi[ , i] <- expit(esti_hamstring[ , 3] + esti_hamstring[ , 4]*i)
+}
+
+for(i in 1:10){
+    estimaciones_hamstring[ , i] <- (1 - pi[ , i]) * lambda[ , i]
+}
+
+mean_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    x[1, i] <- mean(y[ , i])
+  }
+  return(x)
+}
+
+media_estimaciones <- matrix(ncol = 10, nrow = 1)
+media_estimaciones <- mean_estimaciones(media_estimaciones, estimaciones_hamstring)
+rownames(media_estimaciones) <- "Hamstring"
+colnames(media_estimaciones) <- year_names
+
+ql_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    x[1, i] <- quantile(y[ , i], 0.025)
+  }
+  return(x)
+}
+
+ICl_estimaciones <- matrix(ncol = 10, nrow = 1)
+ICl_estimaciones <- ql_estimaciones(ICl_estimaciones, estimaciones_hamstring)
+rownames(ICl_estimaciones) <- "Hamstring"
+colnames(ICl_estimaciones) <- year_names
+
+qu_estimaciones <- function(x, y){ 
+  for (i in 1:10){
+    x[1, i] <- quantile(y[ , i], 0.975)
+  }
+  return(x)
+}
+
+ICu_estimaciones <- matrix(ncol = 10, nrow = 1)
+ICu_estimaciones <- qu_estimaciones(ICu_estimaciones, estimaciones_hamstring)
+rownames(ICu_estimaciones) <- "Hamstring"
+colnames(ICu_estimaciones) <- year_names
+
+```
+
+**Gráfica de las estimaciones**
+
+```{r, warning = FALSE}
+mean <- as.data.frame(media_estimaciones)
+mean$Muestra <- rownames(media_estimaciones)
+datos_long_mean <- gather(mean, key = "Year", value = "Mean", -Muestra)
+ql <- as.data.frame(ICl_estimaciones)
+ql$Muestra <- rownames(ICl_estimaciones)
+datos_long_ql <- gather(ql, key = "Year", value = "qL", -Muestra)
+qu <- as.data.frame(ICu_estimaciones)
+qu$Muestra <- rownames(ICu_estimaciones)
+datos_long_qu <- gather(qu, key = "Year", value = "qU", -Muestra)
+
+datos_long_ham <- cbind(datos_long_mean, datos_long_ql$qL, datos_long_qu$qU)
+colnames(datos_long_ham)[4] <- "qL"
+colnames(datos_long_ham)[5] <- "qU"
+
+# Crear el gráfico con ggplot2
+ggplot(datos_long_ham, aes(x = Year, y = Mean, group = Muestra, color = Muestra)) +
+  geom_line(size = 1.25) + 
+  geom_point(size = 1.5, stroke = 2) +
+  geom_ribbon(aes(x = Year, ymin = qL, ymax = qU, fill = Muestra), alpha=0.3) +
+  xlab("Año") + 
+  ylab("Número de dias perdidos") +
+  scale_color_manual(values = c("red")) +
+  scale_fill_manual(values=c("red", "black")) +
+ theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        panel.grid.major = element_line(colour = "gray80", size = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA))
+
+```
+
+Vemos que la tendencia es creciente a lo largo de los años. Esto puede ser alarmante ya que se observa que a lo largo de los años el número de días perdidos por esta lesiones es mayor, por lo que puede que la lesión cada vez sea más grave. Esto irá unido a que los entrenamientos y los jugadores no están adecuadamente preparados para evitar este tipo de lesiones, la cual es la más frecuente a día de hoy.
+
+
+### ¿Sobredispersion?
+
+```{r, warning = FALSE}
+modelo <- glm(days_missed ~ 1, family = poisson, data = injuries_all_league_lesiones)
+
+summary(modelo)
+par(mfrow=c(2,2)); plot(modelo); par(mfrow=c(1,1))
+
+# Contraste de Kolmogorov-Smirnov
+ks.test(x = rstudent(modelo), y = "pt", df = 40)
+
+# Homocedasticidad
+grupos <- cut(modelo$fitted.values, quantile(modelo$fitted.values, (0:4)/4),
+include.lowest = TRUE)
+lawstat::levene.test(rstandard(modelo), grupos)
+
+#Deviance
+1-(modelo$deviance/modelo$null.deviance)
+
+# proporción de deviance explicada
+pchisq(modelo$deviance, df = modelo$df.residual, lower.tail = FALSE)# constraste chi cuadrado
+```
+
+```{r}
+dispersiontest(modelo)
+```
+
+Crei que el p-valor del test de dispersiontest sea < 0.05 significa que hay sobre dispersion. Por ello hay que corregirlo y una posible opcion es utilizar una distribucion que ajuste mejor los datos. A demas que el ajuste Chi Cuadrado no indica un buen ajuste para nada. Ademas la representacion de las predicciones frente a los residuos estandarizados no es buena y los residuos de perason no siguen una normal (grafica). Ademas lo residuos de DEVIANCE no están entre -2 y 2.
+
+### Otros
+
+```{r}
+y <- players_all_league_criterio$injuries_total
+
+# LOAD LIBRARIES
+library(fitdistrplus)    # fits distributions using maximum likelihood
+library(gamlss)          # defines pdf, cdf of ZIP
+
+mean <- mean(y[y > 0])
+sd <- sum(y == 0)/length(y)
+```
+
+
+```{r}
+pois <- fitdist(y, "pois")
+plot(pois)
+gofstat(pois)
+
+plotdist(y, "pois", para = list(lambda = mean(y)), discrete = TRUE)
+plotdist(y, "pois", para = list(lambda = mean(y)), discrete = TRUE)
+```
+
+
+
+```{r}
+# FIT DISTRIBUTION (mu = mean of poisson, sigma = P(X = 0)
+fit_zip <- fitdist(y, 'ZIP', start = list(mu = mean, sigma = sd))
+
+# VISUALIZE TEST AND COMPUTE GOODNESS OF FIT    
+plot(fit_zip)
+gofstat(fit_zip)
+```
+
+Tanto en el AIC como en el BIC vemos que la variable respuesta se ajusta mejor con una ZIP que con una Poisson
+
+#### otros 2
+
+#### VR: injuries_total
+
+```{r}
+require(gamlss.dist)
+
+y <- players_all_league_criterio$injuries_total
+mean <- mean(y[y > 0])
+sd <- sum(y == 0)/length(y)
+
+plotdist(y, discrete = TRUE)
+fitzip <- fitdist(y, "ZIP", start = list(mu = mean, sigma = sd), discrete = TRUE,
+optim.method = "L-BFGS-B", lower = c(0, 0), upper = c(Inf, 1))
+summary(fitzip)
+plot(fitzip)
+
+fitp <- fitdist(y, "pois")
+
+cdfcomp(list(fitzip, fitp))
+gofstat(list(fitzip, fitp))
+
+```
+
+#### VR: days_lost_total
+
+```{r}
+y <- players_all_league_criterio$days_lost_total
+mean <- mean(y[y > 0])
+sd <- sum(y == 0)/length(y)
+
+plotdist(y, discrete = TRUE)
+fitzip <- fitdist(y, "ZIP", start = list(mu = mean, sigma = sd), discrete = TRUE,
+optim.method = "L-BFGS-B", lower = c(0, 0), upper = c(Inf, 1))
+summary(fitzip)
+plot(fitzip)
+
+fitp <- fitdist(y, "pois")
+
+cdfcomp(list(fitzip, fitp))
+gofstat(list(fitzip, fitp))
+
+```
+
+#### VR: days_missed
+
+```{r}
+y <- injuries_all_league_lesiones$days_missed
+mean <- mean(y[y > 0])
+sd <- sum(y == 0)/length(y)
+
+plotdist(y)
+fitp <- fitdist(y, "pois")
+
+cdfcomp(fitp)
+gofstat(fitp)
+
+```
+
+### Tabla 2: descriptiva variables explicativas
+
+```{r}
+raw_df_exposures <- players_all_league_criterio
+raw_df_injuries <- injuries_all_league
+raw_df_injuries_7 <- injuries_all_league_lesiones
+
+# Corregimos
+raw_df_injuries[(raw_df_injuries$until) == "0221-05-06" & !is.na(raw_df_injuries$until), 6] <- "2021-05-06"
+raw_df_injuries <- raw_df_injuries[!is.na(raw_df_injuries$from) & !is.na(raw_df_injuries$until), ]
+
+raw_df_injuries_7 <- raw_df_injuries_7[!is.na(raw_df_injuries_7$from) & !is.na(raw_df_injuries_7$until), ]
+
+# Eliminamos filas donde el from > until
+raw_df_injuries <- raw_df_injuries[raw_df_injuries$from <= raw_df_injuries$until, ]
+raw_df_injuries_7 <- raw_df_injuries_7[raw_df_injuries_7$from <= raw_df_injuries_7$until, ]
+
+df_injuries <- prepare_inj(df_injuries0   = raw_df_injuries,
+                           player         = "player_name",
+                           date_injured   = "from",
+                           date_recovered = "until")
+
+df_exposures <- prepare_exp(df_exposures0 = raw_df_exposures,
+                            player        = "player_name",
+                            date          = "year",
+                            time_expo     = "minutes_played")
+
+## note 'tstart_s' and 'tstop_s' columns
+injd <-  prepare_all(data_exposures = df_exposures,
+                     data_injuries  = df_injuries,
+                     exp_unit = "hours")
+## 7 lesiones
+df_injuries_7 <- prepare_inj(df_injuries0   = raw_df_injuries_7,
+                           player         = "player_name",
+                           date_injured   = "from",
+                           date_recovered = "until")
+
+injd_7 <-  prepare_all(data_exposures = df_exposures,
+                     data_injuries  = df_injuries_7,
+                     exp_unit = "hours")
+```
+
+
+```{r}
+injsummary(injd)
+
+summary_lesiones <- injsummary(injd_7,
+           var_type_injury = "injury",
+           method = "pois",
+           conf_level = 0.95,
+           quiet = FALSE)
+
+injsummary(injd,
+           var_type_injury = "year",
+           method = "zinfpois",
+           conf_level = 0.95,
+           quiet = FALSE)
+```
+
+```{r}
+## Probamos a hacerlo por ligas por ejemplo
+df_exposures_ligas <- prepare_exp(df_exposures0 = raw_df_exposures,
+                            player        = "league",
+                            date          = "year",
+                            time_expo     = "minutes_played")
+
+raw_df_injuries_7$year <- as.integer(raw_df_injuries_7$year)
+raw_df_exposures$year <- as.integer(raw_df_exposures$year)
+aa <- merge(raw_df_injuries_7, raw_df_exposures[, c(2, 5, 7)], by = c("year", "player_id"), all = FALSE)
+
+df_injuries_ligas <- prepare_inj(df_injuries0   = aa,
+                           player         = "league",
+                           date_injured   = "from",
+                           date_recovered = "until")
+
+injd_ligas <-  prepare_all(data_exposures = df_exposures_ligas,
+                     data_injuries  = df_injuries_ligas,
+                     exp_unit = "hours")
+
+summary_ligas <- injsummary(injd_ligas,
+           method = "pois",
+           conf_level = 0.95,
+           quiet = FALSE)
+
+```
+
+## Juntar la base de datos 2
+
+```{r}
+library(dplyr)
+
+# Supongamos que tu base de datos se llama 'data' y tiene las columnas 'player_id', 'year' y 'dias_perdidos'
+
+# Agrupar y sumar los días perdidos por jugador y año
+data_summarized <- injuries_all_league_lesiones %>% 
+  group_by(injury, year) %>% 
+  summarise(days_missed_total = sum(days_missed),
+            n_injuries = n())
+
+# Mostrar el resultado
+print(data_summarized)
+
+sum(data_summarized$n_injuries)
+```
+
+```{r}
+data_summarized$injury <- as.factor(data_summarized$injury)
+lesiones_names <- levels(data_summarized$injury)
+
+lesiones <- list()
+for(i in 1:length(lesiones_names)){
+  nombre <- lesiones_names[i]
+  lesiones[[nombre]] <- as.numeric(data_summarized$injury)
+  lesiones[[nombre]][data_summarized$injury == nombre] <- 1
+  lesiones[[nombre]][data_summarized$injury != nombre] <- 0
+}
+
+# Modelo POISSON
+model_lesiones_sinseason_l <- inla(n_injuries ~ injury,
+  family = "poisson",
+  data = data.frame(n_injuries = data_summarized$n_injuries, injury = data_summarized$injury),
+  control.fixed = list(prec = 1, prec.intercept = 1),
+  control.compute = list(waic = TRUE, config = TRUE))
+
+# miramos que efecto tiene cada año en el numero de lesiones totales
+round(model_lesiones_sinseason_l$summary.fix, 4)
+
+```
+
+**Cálculo del IR y IRR**
+
+```{r, warning=FALSE}
+# Generando samples de la posterior para cada tipo de lesión y para el overall
+n <- 1000
+samples_les_sinseason_l <- inla.posterior.sample(n = n, 
+                                 res = model_lesiones_sinseason_l)
+
+# Funcion para guardar en matrices los valores de cada parametro de las 1000 simulaciones
+sample_status <- function(x, y) {
+  for(i in 1:n){
+    x[i, 1] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-6]
+    x[i, 2] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-5]
+    x[i, 3] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-4]
+    x[i, 4] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-3]
+    x[i, 5] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-2]
+    x[i, 6] <- y[[i]]$latent[dim(y[[i]]$latent)[1]-1]
+    x[i, 7] <- y[[i]]$latent[dim(y[[i]]$latent)[1]]
+    x[i, 8] <- y[[i]]$hyperpar[[1]]
+    x[i, 9] <- y[[i]]$hyperpar[[2]]
+    x[i, 10] <- y[[i]]$hyperpar[[3]]
+    x[i, 11] <- y[[i]]$hyperpar[[4]]
+    x[i, 12] <- y[[i]]$hyperpar[[5]]
+    x[i, 13] <- y[[i]]$hyperpar[[6]]
+    x[i, 14] <- y[[i]]$hyperpar[[7]]
+  }
+  return(x)
+}
+
+ss <- matrix(NA, nrow = n, ncol = 14)
+colnames(ss) <- c("b_lesion1", "b_lesion2", "b_lesion3", "b_lesion4", "b_lesion5", 
+                  "b_lesion6", "b_lesion7", "zi_lesion1", "zi_lesion2", "zi_lesion3", 
+                  "zi_lesion4", "zi_lesion5", "zi_lesion6", "zi_lesion7")
+
+ss <- sample_status(ss, samples_les_sinseason_l)
+
+IR_code_eqq <- function(x, y){
+  # IR para cada grupo de Status
+  x[, 1] <- exp(y[, 1])/(1 + exp(y[, 8]))
+  x[, 2] <- exp(y[, 1] + y[, 2])/(1 + exp(y[, 8] + y[, 9]))
+  x[, 3] <- exp(y[, 1] + y[, 3])/(1 + exp(y[, 8] + y[, 10]))
+  x[, 4] <- exp(y[, 1] + y[, 4])/(1 + exp(y[, 8] + y[, 11]))
+  x[, 5] <- exp(y[, 1] + y[, 5])/(1 + exp(y[, 8] + y[, 12]))
+  x[, 6] <- exp(y[, 1] + y[, 6])/(1 + exp(y[, 8] + y[, 13]))
+  x[, 7] <- exp(y[, 1] + y[, 7])/(1 + exp(y[, 8] + y[, 14]))
+  
+  # IRR entre grupos de Status
+  x[, 8] <- exp(y[, 2])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 9]))
+  x[, 9] <- exp(y[, 3])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 10]))
+  x[, 10] <- exp(y[, 4])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 11]))
+  x[, 11] <- exp(y[, 5])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 12]))
+  x[, 12] <- exp(y[, 6])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 13]))
+  x[, 13] <- exp(y[, 7])*(1 + exp(y[, 8]))/(1 + exp(y[, 8] + y[, 14]))
+  
+  x[, 14] <- (exp(y[, 3])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 10])))
+  x[, 15] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 16] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 17] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 18] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 9])))/(exp(y[, 2])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 19] <- (exp(y[, 4])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 11])))
+  x[, 20] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 21] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 22] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 10] )))/(exp(y[, 3])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 23] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 12])))
+  x[, 24] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 25] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 11] )))/(exp(y[, 4])*(1 + exp(y[, 8] + y[, 14])))
+  
+  x[, 26] <- (exp(y[, 6])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 13])))
+  x[, 27] <- (exp(y[, 5])*(1 + exp(y[, 8] + y[, 12] )))/(exp(y[, 5])*(1 + exp(y[, 8] + y[, 14])))
+      
+  x[, 28] <- (exp(y[, 7])*(1 + exp(y[, 8] + y[, 13] )))/(exp(y[, 6])*(1 + exp(y[, 8] + y[, 14])))
+  return(x)
+}
+
+IR_les_sinseason_l <- matrix(NA, nrow = n, ncol = 28)
+colnames(IR_les_sinseason_l) <- c("IR_ankle", "IR_calf", "IR_foot", "IR_hamstring", 
+                  "IR_knee", "IR_muscle", "IR_shoulder", "IRR_e2VSe1", "IRR_e3VSe1", "IRR_e4VSe1", 
+                  "IRR_e5VSe1", "IRR_e6VSe1", "IRR_e7VSe1", "IRR_e3VSe2", "IRR_e4VSe2", "IRR_e5VSe2",
+                  "IRR_e6VSe2", "IRR_e7VSe2", "IRR_e4VSe3", "IRR_e5VSe3", "IRR_e6VSe3", "IRR_e7VSe3",
+                  "IRR_e5VSe4", "IRR_e6VSe4", "IRR_e7VSe4", "IRR_e6VSe5", "IRR_e7VSe5", "IRR_e7VSe6")
+
+IR_les_sinseason_l <- IR_code_eqq(IR_les_sinseason_l, ss)
+
+myq <- matrix(NA, nrow = 3, ncol = 28)
+colnames(myq) <- colnames(IR_les_sinseason_l)
+rownames(myq) <- c("mean", "IC_lower", "IC_upper")
+
+myq_IR <- function(x, y){ 
+  for (i in 1:ncol(myq)){
+    x[1, i] <- round(mean(y[, i]), 2)
+    x[2, i] <- round(quantile(y[, i], 0.025), 2)
+    x[3, i] <- round(quantile(y[, i], 0.975), 2)
+  }
+  return(x)
+}
+
+myq <- myq_IR(myq, IR_les_sinseason_l)
+
+# tabla
+Injury <- c("Lesiones Totales")
+injuries <- cbind(paste0(myq[1, 1], "(", myq[2, 1], "-", myq[3, 1], ")"),
+                  paste0(myq[1, 2], "(", myq[2, 2], "-", myq[3, 2], ")"),
+                  paste0(myq[1, 3], "(", myq[2, 3], "-", myq[3, 3], ")"),
+                  paste0(myq[1, 4], "(", myq[2, 4], "-", myq[3, 4], ")"),
+                  paste0(myq[1, 5], "(", myq[2, 5], "-", myq[3, 5], ")"),
+                  paste0(myq[1, 6], "(", myq[2, 6], "-", myq[3, 6], ")"),
+                  paste0(myq[1, 7], "(", myq[2, 7], "-", myq[3, 7], ")"),
+                  paste0(myq[1, 8], "(", myq[2, 8], "-", myq[3, 8], ")"),
+                  paste0(myq[1, 9], "(", myq[2, 9], "-", myq[3, 9], ")"),
+                  paste0(myq[1, 10], "(", myq[2, 10], "-", myq[3, 10], ")"),
+                  paste0(myq[1, 11], "(", myq[2, 11], "-", myq[3, 11], ")"),
+                  paste0(myq[1, 12], "(", myq[2, 12], "-", myq[3, 12], ")"),
+                  paste0(myq[1, 13], "(", myq[2, 13], "-", myq[3, 13], ")"),
+                  paste0(myq[1, 14], "(", myq[2, 14], "-", myq[3, 14], ")"),
+                  paste0(myq[1, 15], "(", myq[2, 15], "-", myq[3, 15], ")"),
+                  paste0(myq[1, 16], "(", myq[2, 16], "-", myq[3, 16], ")"),
+                  paste0(myq[1, 17], "(", myq[2, 17], "-", myq[3, 17], ")"),
+                  paste0(myq[1, 18], "(", myq[2, 18], "-", myq[3, 18], ")"),
+                  paste0(myq[1, 19], "(", myq[2, 19], "-", myq[3, 19], ")"),
+                  paste0(myq[1, 20], "(", myq[2, 20], "-", myq[3, 20], ")"),
+                  paste0(myq[1, 21], "(", myq[2, 21], "-", myq[3, 21], ")"),
+                  paste0(myq[1, 22], "(", myq[2, 22], "-", myq[3, 22], ")"),
+                  paste0(myq[1, 23], "(", myq[2, 23], "-", myq[3, 23], ")"),
+                  paste0(myq[1, 24], "(", myq[2, 24], "-", myq[3, 24], ")"),
+                  paste0(myq[1, 25], "(", myq[2, 25], "-", myq[3, 25], ")"),
+                  paste0(myq[1, 26], "(", myq[2, 26], "-", myq[3, 26], ")"),
+                  paste0(myq[1, 27], "(", myq[2, 27], "-", myq[3, 27], ")"),
+                  paste0(myq[1, 28], "(", myq[2, 28], "-", myq[3, 28], ")"))
+
+nombres <- c(paste0(" "),
+             paste0(lesiones_names[1]),
+             paste0(lesiones_names[2]),
+             paste0(lesiones_names[3]),
+             paste0(lesiones_names[4]),
+             paste0(lesiones_names[5]),
+             paste0(lesiones_names[6]),
+             paste0(lesiones_names[7]),
+             paste0(lesiones_names[2], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[3], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[1]),
+             paste0(lesiones_names[3], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[2]),
+             paste0(lesiones_names[4], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[3]),
+             paste0(lesiones_names[5], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[4]),
+             paste0(lesiones_names[6], " VS ", lesiones_names[5]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[5]),
+             paste0(lesiones_names[7], " VS ", lesiones_names[6]))
+
+data_les <- data.frame(Injury, injuries)
+tabla_les_sinseason_l <- kable(data_les, col.names = nombres #, format = "latex"
+)
+```
+
+```{r}
+# tabla
+tabla_les_sinseason_l
+# boxplot
+boxplot(IR_les_sinseason_l[, 1:7])
+```
+
+
+```{r}
+datos1 <- IR_ligas[, 1:5]
+colnames(datos1) <- c("Bundesliga", "La Liga", "Ligue 1", "Premier", "Serie A")
+datos1 <- as.data.frame(datos1)
+
+datos_transformados1 <- datos1 %>%
+  pivot_longer(cols = c("Bundesliga", "La Liga", "Ligue 1", "Premier", "Serie A"),
+               names_to = "liga",
+               values_to = "tasas")
+
+datos2 <- BR_ligas[, 1:5]
+colnames(datos2) <- c("Bundesliga", "La Liga", "Ligue 1", "Premier", "Serie A")
+datos2 <- as.data.frame(datos2)
+
+datos_transformados2 <- datos2 %>%
+  pivot_longer(cols = c("Bundesliga", "La Liga", "Ligue 1", "Premier", "Serie A"),
+               names_to = "liga",
+               values_to = "tasas")
+
+datos_transformados3 <- cbind(datos_transformados1, datos_transformados2)
+datos_transformados3 <- as.data.frame(datos_transformados3[, c(1, 2, 4)])
+colnames(datos_transformados3) <- c("liga", "IR", "BR")
+
+ggplot(data = datos_transformados3, aes(x = BR, y = IR)) +
+  geom_boxplot() +
+```
+
